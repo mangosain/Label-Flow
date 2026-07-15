@@ -1,0 +1,853 @@
+"use strict";
+/**
+ * Admin panel. Loopback-only (see server.js) so there is no login: whoever
+ * can reach this page IS the admin. Flow: create a project once -> upload a
+ * dataset (with an optional, separate annotations folder) -> manage labels
+ * -> browse/annotate/export images.
+ *
+ * The dataset upload panel is the important bit for this feature: choosing
+ * an annotations folder is entirely optional. If skipped, images import
+ * unlabeled exactly like before. If chosen, lib/importer.js flat-matches
+ * every file in that folder to an image by filename and plots whatever it
+ * finds as normal, fully editable shapes (same select/drag/resize/relabel
+ * tools the labelers use) -- see the "Supports ..." line in the panel for
+ * which formats are understood.
+ */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const app = $("#app");
+
+let state = { project: null, stats: null, users: [] };
+let imagesPage = { images: [], total: 0, offset: 0, limit: 50, status: "ALL", q: "" };
+let uploadState = { datasetPath: "", annotationsPath: "", annotationsPathCleared: false, lastResult: null, importing: false };
+let searchDebounce = null;
+// Snapshot of the image list + filters at the moment an editor was opened
+// from a gallery row, so Prev/Next can walk it (and lazily fetch adjacent
+// pages when you reach an edge) without re-deriving it from scratch.
+let editorNav = null;
+// The AnnotationCanvas of whichever editor is currently open, if any. Kept
+// at module scope (rather than only as openEditor()'s local const) so the
+// single global keyboard-shortcut listener below can reach it.
+let activeCanvas = null;
+
+// Tool switching lives here (module scope, added once) so it works whether
+// triggered by a button click or a global keyboard shortcut, and so we only
+// ever attach ONE keydown listener for the page's lifetime (attaching this
+// inside openEditor() would stack a new listener every time an image is opened).
+function selectTool(name) {
+  if (!activeCanvas) return;
+  const btn = document.querySelector(`[data-tool="${name}"]`);
+  if (!btn) return;
+  document.querySelectorAll("[data-tool]").forEach((x) => x.classList.remove("active"));
+  btn.classList.add("active");
+  activeCanvas.setTool(name);
+  const el = $("#holder .anno-canvas");
+  if (el) el.classList.toggle("select", name === "select");
+}
+
+window.addEventListener("keydown", (e) => {
+  if (!activeCanvas || !e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  const key = e.key.toLowerCase();
+  const map = { a: "select", s: "bbox", d: "polygon" };
+  if (map[key]) { e.preventDefault(); selectTool(map[key]); }
+});
+
+// Ctrl/Cmd+S saves, same as clicking the Save button -- see app.js for the
+// identical labeler-side version and the reasoning (always prevents the
+// browser save dialog, works even while a floating input has focus).
+window.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "s") return;
+  e.preventDefault();
+  const btn = $("#save");
+  if (btn && !btn.disabled) btn.click();
+});
+
+async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  const res = await fetch(path, { ...opts, headers });
+  let data = {};
+  try { data = await res.json(); } catch { /* non-JSON (e.g. empty) response */ }
+  if (!res.ok) throw Object.assign(new Error(data.error || `Request failed (${res.status})`), { data });
+  return data;
+}
+
+const escAttr = (s) => String(s || "").replace(/"/g, "&quot;");
+
+function timeAgo(iso) {
+  if (!iso) return "";
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+// ---------------- boot / project picker ----------------
+async function refreshState() { state = await api("/api/admin/state"); }
+
+async function boot() {
+  // A fresh boot always follows create/resume/unload -- never carry stale
+  // dataset-path fields or list filters from whichever project was active
+  // before into the next one.
+  uploadState = { datasetPath: "", annotationsPath: "", annotationsPathCleared: false, lastResult: null, importing: false };
+  imagesPage = { images: [], total: 0, offset: 0, limit: 50, status: "ALL", q: "" };
+  editorNav = null;
+
+  try { await refreshState(); }
+  catch (err) {
+    app.innerHTML = `<div class="page"><div class="notice err">Could not reach the server: ${err.message}</div></div>`;
+    return;
+  }
+  $("#proj-name").textContent = state.project ? state.project.name : "";
+  if (!state.project) return renderProjectPicker();
+  renderDashboard();
+}
+
+async function renderProjectPicker(error) {
+  let projects = [];
+  try { projects = (await api("/api/admin/projects")).projects; } catch { /* show create form regardless */ }
+
+  app.innerHTML = `
+    <div class="center-screen">
+      <div style="width: 460px;">
+        ${projects.length ? `
+        <div class="card" style="padding:20px; margin-bottom:16px;">
+          <h2>Resume a project</h2>
+          <div class="stack" style="margin-top:10px;">
+            ${projects.map((p) => `
+              <div class="row" style="justify-content:space-between; padding:8px 10px; border:1px solid var(--line); border-radius:8px;">
+                <div style="min-width:0;">
+                  <div style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${p.name}</div>
+                  <div class="faint">${p.imageCount} image(s) · ${p.completedCount} completed · ${p.labelCount} label(s)</div>
+                </div>
+                <div class="row">
+                  <button class="btn sm primary" data-resume="${p.id}" type="button">Resume</button>
+                  <button class="btn sm danger" data-delete="${p.id}" data-delete-name="${escAttr(p.name)}" type="button" title="Delete permanently">Delete</button>
+                </div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+        <form id="create-project" class="card" style="padding: 26px;">
+          <h1 style="margin-bottom: 4px;">New project</h1>
+          <p class="muted" style="margin-bottom: 14px;">Give it a name, then upload a dataset from the dashboard.</p>
+          ${error ? `<div class="notice err" style="margin-bottom: 10px;">${error}</div>` : ""}
+          <label class="faint">Project name</label>
+          <input class="input" name="name" required autofocus placeholder="e.g. Odia OCR — batch 3" style="margin-top:4px;" />
+          <label class="faint" style="display:block; margin-top:12px;">Starting labels <span class="faint">(optional, comma-separated)</span></label>
+          <input class="input" name="labels" placeholder="word, line, table" style="margin-top:4px;" />
+          <button class="btn primary" style="width:100%; margin-top:16px;">Create project</button>
+        </form>
+      </div>
+    </div>`;
+
+  $("#create-project").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const name = String(fd.get("name") || "").trim();
+    const labels = String(fd.get("labels") || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!name) return;
+    try {
+      await api("/api/admin/project", { method: "POST", body: JSON.stringify({ name, labels }) });
+      await boot();
+    } catch (err) { renderProjectPicker(err.message); }
+  });
+  document.querySelectorAll("[data-resume]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true; btn.textContent = "Resuming…";
+      try {
+        await api(`/api/admin/projects/${btn.dataset.resume}/activate`, { method: "POST" });
+        await boot();
+      } catch (err) { alert(err.message); btn.disabled = false; btn.textContent = "Resume"; }
+    });
+  });
+  document.querySelectorAll("[data-delete]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const ok = await confirmDeleteProject(btn.dataset.delete, btn.dataset.deleteName);
+      if (ok) renderProjectPicker();
+    });
+  });
+}
+
+/**
+ * Two-step, deliberately annoying confirmation for an irreversible action:
+ * a confirm() explaining exactly what is and isn't deleted, then a prompt()
+ * requiring the project's exact name to be typed back. Returns true if the
+ * project was actually deleted.
+ */
+async function confirmDeleteProject(id, name) {
+  const step1 = confirm(
+    `Permanently delete "${name}"?\n\n` +
+    `This removes every image record, annotation, and label this app has for the project, ` +
+    `and cannot be undone.\n\n` +
+    `The dataset and annotations folders on your disk are NOT touched — only this app's ` +
+    `tracking data goes away.`
+  );
+  if (!step1) return false;
+  const typed = prompt(`Type the project name exactly to confirm: "${name}"`);
+  if (typed !== name) {
+    if (typed !== null) alert("Name didn't match — nothing was deleted.");
+    return false;
+  }
+  try {
+    await api(`/api/admin/projects/${id}`, { method: "DELETE" });
+    return true;
+  } catch (err) {
+    alert(err.message);
+    return false;
+  }
+}
+
+// ---------------- dashboard shell ----------------
+function renderDashboard() {
+  activeCanvas = null; // leaving the editor (if we were in one) -- shortcuts should go quiet
+  if (!uploadState.datasetPath && state.project.datasetPath) uploadState.datasetPath = state.project.datasetPath;
+  // Pre-fill from whatever the project already has on file -- but NOT if the
+  // user just explicitly cleared this field: without that check, Clear would
+  // blank the field and then this exact line (running again on the
+  // re-render Clear triggers) would immediately put the old path right back,
+  // making the button look completely broken.
+  if (!uploadState.annotationsPath && !uploadState.annotationsPathCleared && state.project.annotationsPath) uploadState.annotationsPath = state.project.annotationsPath;
+
+  $("#proj-name").textContent = state.project.name;
+  app.innerHTML = `
+    <div class="page" style="max-width:1200px;">
+      <div class="row" style="justify-content:space-between; margin-bottom:16px;">
+        <div>
+          <h1>${state.project.name}</h1>
+          <div id="stats-badges" class="row" style="margin-top:6px;"></div>
+        </div>
+        <div class="row">
+          <button id="unload" class="btn sm" type="button">Unload project</button>
+          <button id="refresh" class="btn sm">Refresh</button>
+        </div>
+      </div>
+      <div class="admin-grid">
+        <div class="stack">
+          ${renderUploadPanel()}
+          ${renderImagesPanel()}
+        </div>
+        <div class="stack">
+          ${renderLabelsPanel()}
+          ${renderExportPanel()}
+          ${renderUsersPanel()}
+        </div>
+      </div>
+      <section class="card" style="padding:16px; margin-top:20px; border-color:#fecaca;">
+        <h2 style="color:var(--red);">Danger zone</h2>
+        <p class="faint" style="margin:6px 0 10px;">
+          Permanently deletes this project's tracking data — image list, every annotation, labels,
+          claim history — from this app. The dataset and annotations folders on disk are never
+          touched; re-running Import against the same folder later starts a brand-new, empty project.
+        </p>
+        <button id="delete-project" class="btn sm danger" type="button">Delete this project permanently</button>
+      </section>
+    </div>`;
+
+  updateStatsBadges();
+  wireDashboard();
+  loadImages();
+}
+
+function updateStatsBadges() {
+  const s = state.stats || { total: 0, unclaimed: 0, claimed: 0, completed: 0 };
+  const el = $("#stats-badges");
+  if (!el) return;
+  el.innerHTML = `
+    <span class="badge gray">${s.total} total</span>
+    <span class="badge gray">${s.unclaimed} unclaimed</span>
+    <span class="badge amber">${s.claimed} in progress</span>
+    <span class="badge green">${s.completed} completed</span>`;
+}
+
+function wireDashboard() {
+  $("#refresh").addEventListener("click", async () => { await refreshState(); renderDashboard(); });
+  $("#unload").addEventListener("click", async () => {
+    if (!confirm("Unload this project? Nothing is deleted — every image, annotation, and label stays exactly as it is, and you can resume from the project picker any time.")) return;
+    try { await api("/api/admin/unload", { method: "POST" }); await boot(); }
+    catch (err) { alert(err.message); }
+  });
+  $("#delete-project").addEventListener("click", async () => {
+    const ok = await confirmDeleteProject(state.project.id, state.project.name);
+    if (ok) await boot();
+  });
+  wireUploadPanel();
+  wireImagesPanel();
+  wireLabelsPanel();
+  wireExportPanel();
+}
+
+// ---------------- upload panel (dataset + optional annotations folder) ----------------
+function renderUploadPanel() {
+  return `
+    <section id="upload-panel" class="card" style="padding:16px;">
+      <h2>Upload dataset</h2>
+      <p class="faint" style="margin-bottom:12px;">
+        Point at a folder of images. Optionally also point at a separate folder of existing
+        annotations — they're matched to images by filename and plotted automatically as
+        editable bboxes/polygons using the same select/drag/resize tools as everywhere else.
+      </p>
+      <div class="stack">
+        <div>
+          <label class="faint">Dataset folder</label>
+          <div class="row" style="margin-top:4px; flex-wrap:nowrap;">
+            <input class="input grow" id="dataset-path" value="${escAttr(uploadState.datasetPath)}" placeholder="/path/to/images" />
+            <button class="btn sm" id="browse-dataset" type="button">Browse…</button>
+          </div>
+        </div>
+        <div>
+          <label class="faint">Annotations folder <span class="faint">(optional)</span></label>
+          <div class="row" style="margin-top:4px; flex-wrap:nowrap;">
+            <input class="input grow" id="annotations-path" value="${escAttr(uploadState.annotationsPath)}" placeholder="Not set — images import unlabeled" />
+            <button class="btn sm" id="browse-annotations" type="button">Browse…</button>
+            ${uploadState.annotationsPath ? `<button class="btn sm" id="clear-annotations" type="button">Clear</button>` : ""}
+          </div>
+          <p class="faint" style="margin-top:4px;">
+            Supports Pascal VOC XML, this app's JSON, LabelMe JSON, one dataset-wide COCO JSON
+            manifest, YOLO .txt (reads classes.txt / obj.names / data.yaml for names), and raw
+            detector/OCR output ({boxes:[{bbox,confidence}]}) — those import as unlabeled boxes
+            since detector output has no class names, ready for a labeler to name each one.
+            Matching ignores subfolders — a file anywhere in this folder with the same
+            filename (minus extension) as an image is used for it.
+          </p>
+        </div>
+        <button class="btn primary" id="import-btn" ${uploadState.datasetPath ? "" : "disabled"} ${uploadState.importing ? "disabled" : ""}>
+          ${uploadState.importing ? "Importing…" : "Import dataset"}
+        </button>
+        <p class="faint">Safe to re-run: brand-new images are added, and any already-uploaded image with zero shapes gets backfilled from this folder too — no matter its claim/completion status. The only thing never touched is an image that already has shapes, imported or hand-drawn.</p>
+        ${renderImportResult()}
+      </div>
+    </section>`;
+}
+
+function renderImportResult() {
+  const r = uploadState.lastResult;
+  if (!r) return "";
+  if (r.error) return `<div class="notice err">${r.error}</div>`;
+  const formatBits = Object.entries(r.formatCounts || {}).map(([k, v]) => `${v} ${k}`).join(", ");
+  const hasIssues = (r.skipped || []).length || (r.unmatchedAnnotations || []).length;
+  return `
+    <div class="notice ${hasIssues ? "warn" : "info"}">
+      <div>${r.added} new image(s) of ${r.scanned} scanned · ${r.importedLabels} pre-labeled${formatBits ? ` (${formatBits})` : ""}${r.backfilled ? ` · ${r.backfilled} backfilled onto already-uploaded images` : ""}</div>
+      ${r.unmatchedAnnotations && r.unmatchedAnnotations.length ? `<div style="margin-top:6px;"><strong>${r.unmatchedAnnotations.length}</strong> annotation file(s) matched no image at all: ${r.unmatchedAnnotations.slice(0, 8).join(", ")}${r.unmatchedAnnotations.length > 8 ? "…" : ""}</div>` : ""}
+      ${r.alreadyCovered && r.alreadyCovered.length ? `<div class="faint" style="margin-top:6px;">${r.alreadyCovered.length} file(s) matched an image that already has annotations (or is claimed/completed), so were left alone: ${r.alreadyCovered.slice(0, 8).join(", ")}${r.alreadyCovered.length > 8 ? "…" : ""}</div>` : ""}
+      ${r.skipped && r.skipped.length ? `<div style="margin-top:6px;"><strong>${r.skipped.length}</strong> skipped: ${r.skipped.slice(0, 8).map((s) => `${s.name} (${s.reason})`).join("; ")}${r.skipped.length > 8 ? "…" : ""}</div>` : ""}
+    </div>`;
+}
+
+function wireUploadPanel() {
+  $("#dataset-path").addEventListener("change", (e) => { uploadState.datasetPath = e.target.value.trim(); syncImportButton(); });
+  $("#annotations-path").addEventListener("change", (e) => { uploadState.annotationsPath = e.target.value.trim(); });
+  $("#browse-dataset").addEventListener("click", async () => {
+    const p = await browseFolder("Select a dataset folder (images)");
+    if (p) { uploadState.datasetPath = p; renderDashboard(); }
+  });
+  $("#browse-annotations").addEventListener("click", async () => {
+    const p = await browseFolder("Select an annotations folder (JSON / XML / YOLO txt)");
+    if (p) { uploadState.annotationsPath = p; renderDashboard(); }
+  });
+  const clearBtn = $("#clear-annotations");
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    uploadState.annotationsPath = "";
+    uploadState.annotationsPathCleared = true;
+    renderDashboard();
+  });
+  $("#import-btn").addEventListener("click", runImport);
+}
+
+function syncImportButton() {
+  const btn = $("#import-btn");
+  if (btn) btn.disabled = !uploadState.datasetPath || uploadState.importing;
+}
+
+async function browseFolder(title) {
+  try {
+    const data = await api("/api/admin/pick-folder", { method: "POST", body: JSON.stringify({ title }) });
+    return data.cancelled ? null : data.path;
+  } catch (err) {
+    alert(err.message);
+    return null;
+  }
+}
+
+async function runImport() {
+  uploadState.datasetPath = $("#dataset-path").value.trim();
+  uploadState.annotationsPath = $("#annotations-path").value.trim();
+  uploadState.importing = true;
+  renderDashboard();
+  try {
+    const body = { path: uploadState.datasetPath };
+    if (uploadState.annotationsPath) body.annotationsPath = uploadState.annotationsPath;
+    uploadState.lastResult = await api("/api/admin/dataset", { method: "POST", body: JSON.stringify(body) });
+    await refreshState();
+  } catch (err) {
+    uploadState.lastResult = { error: err.message };
+  }
+  uploadState.importing = false;
+  renderDashboard();
+}
+
+// ---------------- images panel ----------------
+function renderImagesPanel() {
+  return `
+    <section id="images-panel" class="card" style="padding:16px;">
+      <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+        <h2 style="margin:0;">Images (${imagesPage.total})</h2>
+        <div class="row">
+          <select id="status-filter" class="input" style="width:auto;">
+            <option value="ALL">All</option>
+            <option value="UNCLAIMED">Unclaimed</option>
+            <option value="CLAIMED">In progress</option>
+            <option value="COMPLETED">Completed</option>
+          </select>
+          <input id="search" class="input" style="width:160px;" placeholder="Search filename…" value="${escAttr(imagesPage.q)}" />
+        </div>
+      </div>
+      <div id="image-list">${renderImageRows()}</div>
+      <div class="pager" style="justify-content:space-between; margin-top:10px;">
+        <button id="prev-page" class="btn sm" ${imagesPage.offset === 0 ? "disabled" : ""}>&larr; Prev</button>
+        <span class="faint">${imagesPage.total ? imagesPage.offset + 1 : 0}–${Math.min(imagesPage.offset + imagesPage.limit, imagesPage.total)} of ${imagesPage.total}</span>
+        <button id="next-page" class="btn sm" ${imagesPage.offset + imagesPage.limit >= imagesPage.total ? "disabled" : ""}>Next &rarr;</button>
+      </div>
+    </section>`;
+}
+
+function renderImageRows() {
+  if (!imagesPage.images.length) return `<p class="faint">No images match.</p>`;
+  return imagesPage.images.map((img) => `
+    <div class="img-row" data-id="${img.id}" style="cursor:pointer;">
+      <img class="thumb" src="/api/image/${img.id}/file" loading="lazy" alt="" />
+      <div class="grow" style="min-width:0;">
+        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${img.fileName}</div>
+        <div class="faint">${img.width}×${img.height} · ${img.annotationCount} shape(s)${img.importedFrom ? ` · from ${img.importedFrom}` : ""}</div>
+      </div>
+      <span class="badge ${img.status === "COMPLETED" ? "green" : img.status === "CLAIMED" ? "amber" : "gray"}">${img.status.toLowerCase()}</span>
+    </div>`).join("");
+}
+
+async function loadImages() {
+  const focusedSearch = document.activeElement && document.activeElement.id === "search";
+  const caret = focusedSearch ? document.activeElement.selectionStart : null;
+  const params = new URLSearchParams({ offset: imagesPage.offset, limit: imagesPage.limit, status: imagesPage.status, q: imagesPage.q });
+  let data;
+  try { data = await api(`/api/admin/images?${params}`); }
+  catch { return; }
+  imagesPage.images = data.images;
+  imagesPage.total = data.total;
+  state.stats = data.stats;
+  const panel = $("#images-panel");
+  if (!panel) return;
+  panel.outerHTML = renderImagesPanel();
+  wireImagesPanel();
+  updateStatsBadges();
+  if (focusedSearch) {
+    const el = $("#search");
+    if (el) { el.focus(); el.setSelectionRange(caret, caret); }
+  }
+}
+
+function wireImagesPanel() {
+  const panel = $("#images-panel");
+  if (!panel) return;
+  panel.querySelector("#status-filter").value = imagesPage.status;
+  panel.querySelector("#status-filter").addEventListener("change", (e) => {
+    imagesPage.status = e.target.value; imagesPage.offset = 0; loadImages();
+  });
+  panel.querySelector("#search").addEventListener("input", (e) => {
+    clearTimeout(searchDebounce);
+    const v = e.target.value;
+    searchDebounce = setTimeout(() => { imagesPage.q = v; imagesPage.offset = 0; loadImages(); }, 300);
+  });
+  panel.querySelector("#prev-page").addEventListener("click", () => {
+    imagesPage.offset = Math.max(0, imagesPage.offset - imagesPage.limit); loadImages();
+  });
+  panel.querySelector("#next-page").addEventListener("click", () => {
+    imagesPage.offset += imagesPage.limit; loadImages();
+  });
+  panel.querySelectorAll(".img-row[data-id]").forEach((row) => {
+    row.addEventListener("click", () => {
+      editorNav = {
+        ids: imagesPage.images.map((i) => ({ id: i.id, fileName: i.fileName })),
+        meta: { offset: imagesPage.offset, limit: imagesPage.limit, status: imagesPage.status, q: imagesPage.q, total: imagesPage.total },
+      };
+      openEditor(row.dataset.id);
+    });
+  });
+}
+
+// ---------------- labels panel ----------------
+function renderLabelsPanel() {
+  const labels = state.project.labels || [];
+  return `
+    <section id="labels-panel" class="card" style="padding:16px;">
+      <h2>Labels</h2>
+      <div class="chips" style="margin:10px 0;">
+        ${labels.length ? labels.map((l) => `
+          <span class="chip"><span class="swatch" style="background:${l.color}"></span>${l.name}<button data-del="${l.id}" title="Delete label" type="button">×</button></span>`).join("")
+          : `<p class="faint">No labels yet.</p>`}
+      </div>
+      <form id="add-label" class="tag-input-row">
+        <input class="input" name="name" placeholder="New label name" />
+        <button class="btn sm">Add</button>
+      </form>
+    </section>`;
+}
+
+function wireLabelsPanel() {
+  const form = $("#add-label");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const input = form.querySelector("input[name=name]");
+    const name = input.value.trim();
+    if (!name) return;
+    try {
+      const res = await api("/api/admin/labels", { method: "POST", body: JSON.stringify({ name }) });
+      if (!state.project.labels.some((l) => l.id === res.label.id)) state.project.labels.push(res.label);
+      refreshLabelsPanel();
+    } catch (err) { alert(err.message); }
+  });
+  document.querySelectorAll("#labels-panel [data-del]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this label? Shapes using it become unlabeled, everywhere.")) return;
+      try {
+        await api(`/api/admin/labels/${btn.dataset.del}`, { method: "DELETE" });
+        state.project.labels = state.project.labels.filter((l) => l.id !== btn.dataset.del);
+        refreshLabelsPanel();
+      } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+function refreshLabelsPanel() {
+  const panel = $("#labels-panel");
+  if (!panel) return;
+  panel.outerHTML = renderLabelsPanel();
+  wireLabelsPanel();
+}
+
+// ---------------- export panel ----------------
+function renderExportPanel() {
+  return `
+    <section id="export-panel" class="card" style="padding:16px;">
+      <h2>Export</h2>
+      <div class="stack">
+        <label class="faint row"><input type="checkbox" id="completed-only" /> Completed images only</label>
+        <p class="faint">
+          Checked: only images someone has explicitly finished with Save &amp; Mark Complete.
+          Unchecked: every image that has any shapes at all — a human's saved work where that
+          exists, otherwise whatever the pre-annotation import found, untouched. Either way,
+          an image with zero shapes gets no file.
+        </p>
+        <p class="faint">
+          JSON and XML are this app's own formats (round-trip losslessly, including polygons
+          and manual line numbers). VOC, COCO, and YOLO are for other tools: VOC has no polygon
+          concept, so polygon shapes export as their bounding box; COCO and YOLO both require a
+          class per shape, so any shape with no label is left out of those two (counted in the
+          download). COCO's download is one combined manifest, not a zip — that's how COCO is
+          normally consumed.
+        </p>
+        <div class="row">
+          <a class="btn sm" href="#" data-export="json">⬇ JSON (zip)</a>
+          <a class="btn sm" href="#" data-export="xml">⬇ XML (zip)</a>
+          <a class="btn sm" href="#" data-export="voc">⬇ VOC (zip)</a>
+          <a class="btn sm" href="#" data-export="coco">⬇ COCO (json)</a>
+          <a class="btn sm" href="#" data-export="yolo">⬇ YOLO (zip)</a>
+        </div>
+      </div>
+    </section>`;
+}
+
+function wireExportPanel() {
+  document.querySelectorAll("#export-panel [data-export]").forEach((a) => {
+    a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const format = a.dataset.export;
+      // Only this app's own two formats have a coordinate system to choose
+      // between -- see askExportCoords() in canvas.js.
+      let coords = null;
+      if (format === "json" || format === "xml") {
+        coords = await askExportCoords();
+        if (!coords) return; // cancelled
+      }
+      const completedOnly = $("#completed-only").checked;
+      const params = new URLSearchParams();
+      if (completedOnly) params.set("completedOnly", "true");
+      if (coords) params.set("coords", coords);
+      const qs = params.toString();
+      window.location.href = `/api/admin/export/${format}${qs ? `?${qs}` : ""}`;
+    });
+  });
+}
+
+// ---------------- users panel ----------------
+function renderUsersPanel() {
+  const users = state.users || [];
+  return `
+    <section class="card" style="padding:16px;">
+      <h2>Labelers</h2>
+      ${users.length ? users.map((u) => `
+        <div class="row" style="justify-content:space-between; padding:5px 0;">
+          <span>${u.name}</span><span class="faint">${timeAgo(u.lastSeenAt)}</span>
+        </div>`).join("") : `<p class="faint">No one has joined yet.</p>`}
+    </section>`;
+}
+
+// ---------------- per-image editor (admin can edit/complete/reopen any image) ----------------
+async function openEditor(imageId) {
+  let data;
+  try { data = await api(`/api/admin/image/${imageId}`); }
+  catch (err) { alert(err.message); return; }
+  const image = data.image;
+
+  const navIdx = editorNav ? editorNav.ids.findIndex((i) => i.id === image.id) : -1;
+  const hasPrev = editorNav && (navIdx > 0 || editorNav.meta.offset > 0);
+  const hasNext = editorNav && navIdx >= 0 && (navIdx < editorNav.ids.length - 1 || editorNav.meta.offset + editorNav.meta.limit < editorNav.meta.total);
+  const navPosition = editorNav && navIdx >= 0 ? `${editorNav.meta.offset + navIdx + 1} of ${editorNav.meta.total}` : "";
+
+  app.innerHTML = `
+    <div class="workspace">
+      <aside class="side">
+        <div class="row" style="justify-content:space-between; flex-wrap:nowrap;">
+          <button id="back" class="btn sm" type="button">&larr; Back</button>
+          ${navPosition ? `<span class="faint">${navPosition}</span>` : ""}
+        </div>
+        ${editorNav ? `
+        <div class="row" style="flex-wrap:nowrap;">
+          <button id="prev-image" class="btn sm" type="button" style="flex:1;" ${hasPrev ? "" : "disabled"}>&larr; Prev</button>
+          <button id="next-image" class="btn sm" type="button" style="flex:1;" ${hasNext ? "" : "disabled"}>Next &rarr;</button>
+        </div>` : ""}
+        <div>
+          <div style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${image.fileName}">${image.fileName}</div>
+          <div class="faint"><span id="dims">${image.width}×${image.height}</span> · <span id="shape-count"></span></div>
+          <span class="badge ${image.status === "COMPLETED" ? "green" : image.status === "CLAIMED" ? "amber" : "gray"}" style="margin-top:6px; display:inline-block;">${image.status.toLowerCase()}</span>
+          ${image.claimedByName ? `<div class="faint">Claimed by ${image.claimedByName}</div>` : ""}
+          ${image.importedFrom ? `<div class="faint" style="color:var(--amber);">Pre-labeled from ${image.importedFrom}</div>` : ""}
+        </div>
+        <div class="stack" style="margin-top:0;">
+          <button id="save" class="btn" style="width:100%">Save</button>
+          <button id="complete" class="btn primary" style="width:100%">Save &amp; Mark Complete</button>
+          ${image.status === "COMPLETED" ? `<button id="reopen" class="btn sm" style="width:100%">Reopen</button>` : ""}
+          <div class="export-grid">
+            <button type="button" class="btn sm" data-coords-export="json">⬇ JSON</button>
+            <button type="button" class="btn sm" data-coords-export="xml">⬇ XML</button>
+            <a class="btn sm" href="/api/admin/export/voc/${image.id}">⬇ VOC</a>
+            <a class="btn sm" href="/api/admin/export/coco/${image.id}">⬇ COCO</a>
+            <a class="btn sm" href="/api/admin/export/yolo/${image.id}">⬇ YOLO</a>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">Tools</div>
+          <div class="tools">
+            <button class="btn sm active" data-tool="select">Select<span class="kbd-badge">⇧A</span></button>
+            <button class="btn sm" data-tool="bbox">Box<span class="kbd-badge">⇧S</span></button>
+            <button class="btn sm" data-tool="polygon">Polygon<span class="kbd-badge">⇧D</span></button>
+          </div>
+        </div>
+        <div class="stack" style="margin-top:0;">
+          <label class="row toggle-row">
+            <input type="checkbox" id="show-line-numbers" />
+            <span>Show line &amp; sequence numbers</span>
+          </label>
+          <label class="row toggle-row">
+            <input type="checkbox" id="show-label-input" />
+            <span>Show label input box</span>
+          </label>
+        </div>
+        <div>
+          <div class="section-title">Labels</div>
+          <div id="labels" class="label-list"></div>
+        </div>
+        <div>
+          <div class="section-title">Shapes</div>
+          <div id="shapes" class="shape-list"></div>
+        </div>
+        <div style="margin-top:auto;" class="kbd-hints">
+          <div class="section-title" style="margin-bottom:4px;">Shortcuts</div>
+          <ul class="kbd-list">
+            <li><kbd>Shift</kbd>+<kbd>A</kbd> Select tool</li>
+            <li><kbd>Shift</kbd>+<kbd>S</kbd> Box tool</li>
+            <li><kbd>Shift</kbd>+<kbd>D</kbd> Polygon tool</li>
+            <li><kbd>Ctrl</kbd>+scroll Zoom</li>
+            <li>Scroll Pan (vertical)</li>
+            <li><kbd>Shift</kbd>+scroll Pan (horizontal)</li>
+            <li><kbd>Del</kbd> Remove shape</li>
+            <li><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</li>
+            <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> Undo</li>
+            <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> Redo</li>
+            <li><kbd>Esc</kbd> Cancel drawing</li>
+            <li><kbd>Enter</kbd> Finish polygon</li>
+          </ul>
+        </div>
+      </aside>
+      <div class="canvas-wrap"><div id="holder" class="canvas-holder"></div></div>
+    </div>`;
+
+  const canvas = new AnnotationCanvas($("#holder"), {
+    getLabels: () => state.project.labels,
+    createLabel: async (name) => {
+      const res = await api("/api/admin/labels", { method: "POST", body: JSON.stringify({ name }) });
+      if (!state.project.labels.some((l) => l.id === res.label.id)) state.project.labels.push(res.label);
+      renderLabelChips();
+      return res.label;
+    },
+    onChange: () => { refreshMeta(); renderShapesList(); },
+  });
+  activeCanvas = canvas;
+  canvas.load(`/api/image/${image.id}/file`, image.width, image.height, image.annotations);
+  $("#holder .anno-canvas").classList.add("select");
+  const showLinesChk = $("#show-line-numbers");
+  showLinesChk.checked = canvas.showLineNumbers;
+  showLinesChk.addEventListener("change", () => canvas.setShowLineNumbers(showLinesChk.checked));
+  const showLabelInputChk = $("#show-label-input");
+  showLabelInputChk.checked = canvas.showLabelInput;
+  showLabelInputChk.addEventListener("change", () => canvas.setShowLabelInput(showLabelInputChk.checked));
+
+  function renderLabelChips() {
+    const el = $("#labels");
+    el.innerHTML = state.project.labels.map((l) =>
+      `<div class="label-item ${canvas.highlightLabelId === l.id ? "active" : ""}">
+         <button type="button" class="label-item-main" data-id="${l.id}" title="Click to highlight every shape with this label on the canvas">
+           <span class="swatch" style="background:${l.color}"></span><span class="grow">${l.name}</span>
+         </button>
+         <button type="button" class="label-item-del" data-del="${l.id}" title="Delete this label (unassigns it from every shape, project-wide)">×</button>
+       </div>`).join("") || `<p class="faint">No labels yet — draw a shape and name it.</p>`;
+    el.querySelectorAll(".label-item-main").forEach((b) => b.addEventListener("click", () => {
+      canvas.setActiveLabel(b.dataset.id);
+      canvas.toggleHighlightLabel(b.dataset.id);
+      renderLabelChips();
+    }));
+    el.querySelectorAll(".label-item-del").forEach((b) => b.addEventListener("click", () => deleteLabelFromEditor(b.dataset.del)));
+  }
+
+  // Same destructive action as the dashboard's Labels panel (delete label,
+  // unassign it from every shape across every image in the project) --
+  // offered here too since editing an image is exactly when you're likely
+  // to notice a label you want gone. The one thing the dashboard version
+  // doesn't need to do: this image's canvas is already loaded in memory, so
+  // if any of ITS shapes used the deleted label, sync that locally too
+  // (canvas.unassignLabel) instead of leaving a stale label displayed until
+  // a reload.
+  async function deleteLabelFromEditor(labelId) {
+    const label = state.project.labels.find((l) => l.id === labelId);
+    if (!confirm(`Delete "${label ? label.name : "this label"}"? Shapes using it become unlabeled, everywhere.`)) return;
+    try {
+      await api(`/api/admin/labels/${labelId}`, { method: "DELETE" });
+      state.project.labels = state.project.labels.filter((l) => l.id !== labelId);
+      if (canvas.highlightLabelId === labelId) canvas.highlightLabelId = null;
+      canvas.unassignLabel(labelId);
+      renderLabelChips();
+      renderShapesList();
+      showToast("Label deleted");
+    } catch (err) { showToast(err.message || "Could not delete label", { type: "error" }); }
+  }
+  function refreshMeta() {
+    const el = $("#shape-count");
+    if (el) el.textContent = `${canvas.getAnnotations().length} shapes`;
+  }
+
+  function renderShapesList() {
+    const el = $("#shapes");
+    if (!el) return;
+    const shapes = canvas.getShapesSummary();
+    el.innerHTML = shapes.map((s) =>
+      `<div class="shape-item ${s.id === canvas.selectedId ? "active" : ""}">
+         <button type="button" class="shape-item-main" data-id="${s.id}">
+           <span class="tag">L${s.line}-${s.seq}</span>
+           <span class="swatch" style="background:${s.color}"></span>
+           <span class="name">${s.labelName || "Unlabeled"}</span>
+         </button>
+         <button type="button" class="shape-item-del" data-del="${s.id}" title="Delete this shape">×</button>
+       </div>`).join("") || `<p class="faint">No shapes yet — draw a box or polygon.</p>`;
+    el.querySelectorAll(".shape-item-main").forEach((b) => b.addEventListener("click", () => canvas.selectAnnotation(b.dataset.id)));
+    el.querySelectorAll(".shape-item-del").forEach((b) => b.addEventListener("click", () => canvas.deleteAnnotation(b.dataset.del)));
+  }
+
+  document.querySelectorAll("[data-tool]").forEach((b) => {
+    b.addEventListener("click", () => selectTool(b.dataset.tool));
+  });
+  // JSON/XML support a coordinate-system choice (normalized/pixel/both), so
+  // they're buttons that ask first, not plain download links -- VOC/COCO/
+  // YOLO stay plain <a> links since their coordinate convention is fixed.
+  document.querySelectorAll("[data-coords-export]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const coords = await askExportCoords();
+      if (!coords) return; // cancelled
+      window.location.href = `/api/admin/export/${b.dataset.coordsExport}/${image.id}?coords=${coords}`;
+    });
+  });
+
+  async function doSave(markComplete) {
+    try {
+      await api(`/api/admin/image/${image.id}/save`, {
+        method: "POST",
+        body: JSON.stringify({ annotations: canvas.getAnnotations(), markComplete }),
+      });
+      canvas.markSaved();
+      await refreshState();
+      showToast(markComplete ? "Saved & marked complete" : "Saved");
+      if (markComplete) return renderDashboard();
+    } catch (err) { showToast(err.message || "Save failed", { type: "error" }); }
+  }
+  $("#save").addEventListener("click", () => doSave(false));
+  $("#complete").addEventListener("click", () => doSave(true));
+  const reopenBtn = $("#reopen");
+  if (reopenBtn) reopenBtn.addEventListener("click", async () => {
+    try { await api(`/api/admin/image/${image.id}/reopen`, { method: "POST" }); await refreshState(); openEditor(image.id); }
+    catch (err) { alert(err.message); }
+  });
+  $("#back").addEventListener("click", () => {
+    if (canvas.isDirty() && !confirm("You have unsaved changes. Leave anyway?")) return;
+    renderDashboard();
+  });
+  const prevBtn = $("#prev-image");
+  const nextBtn = $("#next-image");
+  if (prevBtn) prevBtn.addEventListener("click", () => navigateEditor(image.id, -1, canvas));
+  if (nextBtn) nextBtn.addEventListener("click", () => navigateEditor(image.id, 1, canvas));
+
+  renderLabelChips();
+  renderShapesList();
+  refreshMeta();
+}
+
+/**
+ * Prev/Next within the image list + filters captured when the editor was
+ * opened (editorNav). Walks the already-loaded page first; at an edge,
+ * lazily fetches the adjacent page from the server (same status/search
+ * filter) so navigation crosses page boundaries instead of dead-ending at
+ * whatever page size happened to be loaded.
+ */
+async function navigateEditor(currentImageId, direction, canvas) {
+  if (!editorNav) return;
+  if (canvas.isDirty() && !confirm("You have unsaved changes. Leave anyway?")) return;
+
+  const idx = editorNav.ids.findIndex((i) => i.id === currentImageId);
+  if (idx === -1) return;
+  const targetIdx = idx + direction;
+
+  if (targetIdx >= 0 && targetIdx < editorNav.ids.length) {
+    return openEditor(editorNav.ids[targetIdx].id);
+  }
+
+  // At an edge of the currently loaded page -- fetch the adjacent page
+  // (same filters) and jump to its first/last image.
+  const { meta } = editorNav;
+  const newOffset = direction > 0 ? meta.offset + meta.limit : meta.offset - meta.limit;
+  if (newOffset < 0 || newOffset >= meta.total) return; // truly nothing more in that direction
+
+  let data;
+  try {
+    const params = new URLSearchParams({ offset: newOffset, limit: meta.limit, status: meta.status, q: meta.q });
+    data = await api(`/api/admin/images?${params}`);
+  } catch (err) { alert(err.message); return; }
+  if (!data.images.length) return;
+
+  editorNav = {
+    ids: data.images.map((i) => ({ id: i.id, fileName: i.fileName })),
+    meta: { offset: newOffset, limit: meta.limit, status: meta.status, q: meta.q, total: data.total },
+  };
+  const nextImage = direction > 0 ? editorNav.ids[0] : editorNav.ids[editorNav.ids.length - 1];
+  return openEditor(nextImage.id);
+}
+
+boot();

@@ -1,0 +1,39 @@
+# This app's live database: project/label/image/annotation records.
+# Written to ./state relative to wherever `node server.js` is run from
+# (see STATE_DIR in lib/store.js). Real annotation work, not source code --
+# never something to publish or version alongside the app itself.
+state/
+
+# Orphaned runtime data from the earlier Next.js implementation (SQLite
+# dev.db, thumbnails, migrated JSON snapshots). Not read or written by the
+# current server.js at all.
+data/
+
+# The earlier Next.js + Prisma implementation, superseded by this
+# zero-dependency rewrite. Kept on disk for reference, not part of this
+# repo's history.
+legacy_nextjs_app/
+
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Secrets. This app currently reads config from plain environment variables
+# (PORT/ADMIN_PORT), not a .env file -- but ignoring the whole family now
+# means a future .env someone adds here (or brought over from
+# legacy_nextjs_app for local testing) can never be committed by accident.
+# Track an .env.example instead if you ever want to document expected vars.
+.env*
+!.env.example
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
