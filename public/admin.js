@@ -415,15 +415,17 @@ function renderImagesPanel() {
 
 function renderImageRows() {
   if (!imagesPage.images.length) return `<p class="faint">No images match.</p>`;
-  return imagesPage.images.map((img) => `
-    <div class="img-row" data-id="${img.id}" style="cursor:pointer;">
-      <img class="thumb" src="/api/image/${img.id}/file" loading="lazy" alt="" />
-      <div class="grow" style="min-width:0;">
-        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${img.fileName}</div>
-        <div class="faint">${img.width}×${img.height} · ${img.annotationCount} shape(s)${img.importedFrom ? ` · from ${img.importedFrom}` : ""}</div>
+  return `<div class="image-grid">` + imagesPage.images.map((img) => `
+    <div class="image-card ${img.status === "COMPLETED" ? "completed" : ""}" data-id="${img.id}">
+      <div class="image-card-thumb">
+        <img src="/api/image/${img.id}/file" loading="lazy" alt="" />
+        <span class="badge ${img.status === "COMPLETED" ? "green" : img.status === "CLAIMED" ? "amber" : "gray"}">${img.status.toLowerCase()}</span>
       </div>
-      <span class="badge ${img.status === "COMPLETED" ? "green" : img.status === "CLAIMED" ? "amber" : "gray"}">${img.status.toLowerCase()}</span>
-    </div>`).join("");
+      <div class="image-card-meta">
+        <div class="name" title="${escAttr(img.fileName)}">${img.fileName}</div>
+        <div class="faint">${img.width}×${img.height} · ${img.annotationCount} shape(s)</div>
+      </div>
+    </div>`).join("") + `</div>`;
 }
 
 async function loadImages() {
@@ -465,13 +467,13 @@ function wireImagesPanel() {
   panel.querySelector("#next-page").addEventListener("click", () => {
     imagesPage.offset += imagesPage.limit; loadImages();
   });
-  panel.querySelectorAll(".img-row[data-id]").forEach((row) => {
-    row.addEventListener("click", () => {
+  panel.querySelectorAll(".image-card[data-id]").forEach((card) => {
+    card.addEventListener("click", () => {
       editorNav = {
         ids: imagesPage.images.map((i) => ({ id: i.id, fileName: i.fileName })),
         meta: { offset: imagesPage.offset, limit: imagesPage.limit, status: imagesPage.status, q: imagesPage.q, total: imagesPage.total },
       };
-      openEditor(row.dataset.id);
+      openEditor(card.dataset.id);
     });
   });
 }
@@ -786,7 +788,12 @@ async function openEditor(imageId) {
       canvas.markSaved();
       await refreshState();
       showToast(markComplete ? "Saved & marked complete" : "Saved");
-      if (markComplete) return renderDashboard();
+      // Stay on this image instead of bouncing back to the dashboard grid.
+      // Re-opening it (rather than leaving the pre-save DOM as-is) refreshes
+      // the status badge, claim info, and Reopen button so the sidebar
+      // actually reflects "this is now complete" -- same pattern the Reopen
+      // button below already uses for the same reason.
+      if (markComplete) return openEditor(image.id);
     } catch (err) { showToast(err.message || "Save failed", { type: "error" }); }
   }
   $("#save").addEventListener("click", () => doSave(false));

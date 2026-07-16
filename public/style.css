@@ -142,11 +142,24 @@ h2 { font-size: 16px; margin-bottom: 8px; }
 .line-chip button.manual { color: var(--brand); text-decoration: underline; }
 .line-chip button.auto { color: #cbd5e1; cursor: default; }
 
-/* tables / lists */
-.img-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid #f1f5f9; }
-.img-row:last-child { border-bottom: none; }
-.img-row:hover { background: #f8fafc; }
-.thumb { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); background: #f1f5f9; }
+/* image grid (admin dashboard home) */
+.image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+.image-card {
+  cursor: pointer; border-radius: 10px; border: 2px solid transparent; background: #fff;
+  overflow: hidden; box-shadow: 0 1px 3px rgba(15,23,42,.08);
+  transition: border-color .15s, transform .1s, box-shadow .15s;
+}
+.image-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(15,23,42,.14); }
+/* Completed items get their own green treatment -- border + a wash of green
+   behind the meta area -- so a finished page is obvious at a glance while
+   scanning the grid, not just readable one row at a time in a status column. */
+.image-card.completed { border-color: var(--green); }
+.image-card.completed .image-card-meta { background: #ecfdf5; }
+.image-card-thumb { position: relative; width: 100%; aspect-ratio: 1; background: #f1f5f9; }
+.image-card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.image-card-thumb .badge { position: absolute; top: 6px; right: 6px; box-shadow: 0 1px 4px rgba(15,23,42,.3); }
+.image-card-meta { padding: 8px 10px; }
+.image-card-meta .name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .tag-input-row { display: flex; gap: 6px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
