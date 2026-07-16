@@ -100,7 +100,7 @@ function askExportCoords() {
           <label><input type="radio" name="coords" value="normalized" />
             <span><strong>Normalized</strong><br><span class="faint">0–1, independent of image size</span></span></label>
           <label><input type="radio" name="coords" value="pixel" />
-            <span><strong>Pixel</strong><br><span class="faint">actual x / y / width / height</span></span></label>
+            <span><strong>Absolute</strong><br><span class="faint">actual x / y / width / height</span></span></label>
           <label><input type="radio" name="coords" value="both" checked />
             <span><strong>Both</strong><br><span class="faint">carries either, larger file</span></span></label>
         </div>
