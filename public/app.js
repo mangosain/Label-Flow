@@ -22,13 +22,17 @@ let canvas = null;
 // inside renderWorkspace() would stack a new listener on every image).
 function selectTool(name) {
   if (!canvas) return;
-  const btn = document.querySelector(`[data-tool="${name}"]`);
-  if (!btn) return;
+  // "line-lasso" has no [data-tool] button of its own -- it's driven by the
+  // "Line annotation" checkbox instead -- so the button lookup below is
+  // allowed to come up empty; every OTHER tool still has a real button.
   document.querySelectorAll("[data-tool]").forEach((x) => x.classList.remove("active"));
-  btn.classList.add("active");
+  const btn = document.querySelector(`[data-tool="${name}"]`);
+  if (btn) btn.classList.add("active");
   canvas.setTool(name);
   const el = $("#holder .anno-canvas");
   if (el) el.classList.toggle("select", name === "select");
+  const lassoChk = $("#line-annotation-tool");
+  if (lassoChk) lassoChk.checked = name === "line-lasso";
 }
 
 window.addEventListener("keydown", (e) => {
@@ -36,6 +40,10 @@ window.addEventListener("keydown", (e) => {
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
   const key = e.key.toLowerCase();
+  // Shift+Z is a TOGGLE (on -> off -> on), unlike A/S/D which always select
+  // their tool outright -- matches the "Line annotation" checkbox's own
+  // on/off nature rather than the exclusive Select/Box/Polygon tool group.
+  if (key === "z") { e.preventDefault(); selectTool(canvas.tool === "line-lasso" ? "select" : "line-lasso"); return; }
   const map = { a: "select", s: "bbox", d: "polygon" };
   if (map[key]) { e.preventDefault(); selectTool(map[key]); }
 });
@@ -171,6 +179,10 @@ function renderWorkspace(resumed) {
           <p class="faint" style="margin-top:6px;">Draw a shape — a small box asks you to name it. Names become labels for everyone.</p>
         </div>
         <div class="stack" style="margin-top:0;">
+          <label class="row toggle-row" title="Draw a freeform loop over several shapes to give them all the same line number -- fixes line numbers on a skewed page where the automatic top-to-bottom grouping guesses wrong">
+            <input type="checkbox" id="line-annotation-tool" />
+            <span>Line annotation<span class="kbd-badge">⇧Z</span></span>
+          </label>
           <label class="row toggle-row">
             <input type="checkbox" id="show-line-numbers" />
             <span>Show line &amp; sequence numbers</span>
@@ -194,6 +206,7 @@ function renderWorkspace(resumed) {
             <li><kbd>Shift</kbd>+<kbd>A</kbd> Select tool</li>
             <li><kbd>Shift</kbd>+<kbd>S</kbd> Box tool</li>
             <li><kbd>Shift</kbd>+<kbd>D</kbd> Polygon tool</li>
+            <li><kbd>Shift</kbd>+<kbd>Z</kbd> Toggle line annotation tool</li>
             <li><kbd>Ctrl</kbd>+scroll Zoom</li>
             <li>Scroll Pan (vertical)</li>
             <li><kbd>Shift</kbd>+scroll Pan (horizontal)</li>
@@ -221,12 +234,14 @@ function renderWorkspace(resumed) {
     },
     onChange: () => { refreshMeta(); renderShapesList(); },
   });
-  canvas.load(`/api/image/${currentImage.id}/file`, currentImage.width, currentImage.height, currentImage.annotations);
+  canvas.load(`/api/image/${currentImage.id}/file`, currentImage.width, currentImage.height, currentImage.annotations, currentImage.lineRegions);
   $("#holder .anno-canvas").classList.add("select");
 
   document.querySelectorAll("[data-tool]").forEach((b) => {
     b.addEventListener("click", () => selectTool(b.dataset.tool));
   });
+  const lineAnnoChk = $("#line-annotation-tool");
+  lineAnnoChk.addEventListener("change", () => selectTool(lineAnnoChk.checked ? "line-lasso" : "select"));
   const showLinesChk = $("#show-line-numbers");
   showLinesChk.checked = canvas.showLineNumbers;
   showLinesChk.addEventListener("change", () => canvas.setShowLineNumbers(showLinesChk.checked));
@@ -303,7 +318,7 @@ async function saveWork(complete) {
   }
   const res = await api(`/api/image/${currentImage.id}/${complete ? "complete" : "save"}`, {
     method: "POST",
-    body: JSON.stringify({ annotations: anns }),
+    body: JSON.stringify({ annotations: anns, lineRegions: canvas.getLineRegions() }),
   });
   const data = await res.json();
   if (!res.ok) { showToast(data.error || "Save failed", { type: "error" }); return; }

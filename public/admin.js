@@ -36,13 +36,21 @@ let activeCanvas = null;
 // inside openEditor() would stack a new listener every time an image is opened).
 function selectTool(name) {
   if (!activeCanvas) return;
-  const btn = document.querySelector(`[data-tool="${name}"]`);
-  if (!btn) return;
+  // "line-lasso" has no [data-tool] button of its own -- it's driven by the
+  // "Line annotation" checkbox instead (see wireLineAnnotationToggle) -- so
+  // the button lookup below is allowed to come up empty; every OTHER tool
+  // still has a real button to highlight.
   document.querySelectorAll("[data-tool]").forEach((x) => x.classList.remove("active"));
-  btn.classList.add("active");
+  const btn = document.querySelector(`[data-tool="${name}"]`);
+  if (btn) btn.classList.add("active");
   activeCanvas.setTool(name);
   const el = $("#holder .anno-canvas");
   if (el) el.classList.toggle("select", name === "select");
+  // Keep the checkbox in sync however the tool actually changed -- clicking
+  // a normal tool button while it's checked should uncheck it, same as
+  // checking it should deactivate the normal tool buttons above.
+  const lassoChk = $("#line-annotation-tool");
+  if (lassoChk) lassoChk.checked = name === "line-lasso";
 }
 
 window.addEventListener("keydown", (e) => {
@@ -50,6 +58,10 @@ window.addEventListener("keydown", (e) => {
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
   const key = e.key.toLowerCase();
+  // Shift+Z is a TOGGLE (on -> off -> on), unlike A/S/D which always select
+  // their tool outright -- matches the "Line annotation" checkbox's own
+  // on/off nature rather than the exclusive Select/Box/Polygon tool group.
+  if (key === "z") { e.preventDefault(); selectTool(activeCanvas.tool === "line-lasso" ? "select" : "line-lasso"); return; }
   const map = { a: "select", s: "bbox", d: "polygon" };
   if (map[key]) { e.preventDefault(); selectTool(map[key]); }
 });
@@ -212,7 +224,7 @@ function renderDashboard() {
 
   $("#proj-name").textContent = state.project.name;
   app.innerHTML = `
-    <div class="page" style="max-width:1200px;">
+    <div class="page" style="max-width:1440px;">
       <div class="row" style="justify-content:space-between; margin-bottom:16px;">
         <div>
           <h1>${state.project.name}</h1>
@@ -226,13 +238,14 @@ function renderDashboard() {
       <div class="admin-grid">
         <div class="stack">
           ${renderUploadPanel()}
-          ${renderImagesPanel()}
         </div>
         <div class="stack">
           ${renderLabelsPanel()}
           ${renderExportPanel()}
-          ${renderUsersPanel()}
         </div>
+      </div>
+      <div style="margin-top:20px;">
+        ${renderImagesPanel()}
       </div>
       <section class="card" style="padding:16px; margin-top:20px; border-color:#fecaca;">
         <h2 style="color:var(--red);">Danger zone</h2>
@@ -254,11 +267,42 @@ function updateStatsBadges() {
   const s = state.stats || { total: 0, unclaimed: 0, claimed: 0, completed: 0 };
   const el = $("#stats-badges");
   if (!el) return;
+  const userCount = (state.users || []).length;
   el.innerHTML = `
     <span class="badge gray">${s.total} total</span>
     <span class="badge gray">${s.unclaimed} unclaimed</span>
     <span class="badge amber">${s.claimed} in progress</span>
-    <span class="badge green">${s.completed} completed</span>`;
+    <span class="badge green">${s.completed} completed</span>
+    <button type="button" id="users-pill" class="badge gray pill-btn" title="View labelers">${userCount} labeler${userCount === 1 ? "" : "s"}</button>`;
+  $("#users-pill").addEventListener("click", openUsersDialog);
+}
+
+// Was a standalone "Labelers" card in the right column; now a click-through
+// on the users-pill above (next to the other stat badges) instead, since a
+// whole permanent section for what's usually a short, rarely-checked list
+// took up more space than it earned -- same info, one click away instead of
+// always-on screen real estate.
+function openUsersDialog() {
+  const users = state.users || [];
+  const dlg = document.createElement("dialog");
+  dlg.className = "export-coords-dialog users-dialog";
+  dlg.innerHTML = `
+    <form method="dialog">
+      <h3>Labelers</h3>
+      ${users.length ? `
+        <div class="stack" style="margin-top:10px; max-height:320px; overflow-y:auto;">
+          ${users.map((u) => `
+            <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--line);">
+              <span>${u.name}</span><span class="faint">${timeAgo(u.lastSeenAt)}</span>
+            </div>`).join("")}
+        </div>` : `<p class="faint" style="margin-top:10px;">No one has joined yet.</p>`}
+      <div class="row" style="justify-content:flex-end; margin-top:16px;">
+        <button type="submit" class="btn">Close</button>
+      </div>
+    </form>`;
+  document.body.appendChild(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
 }
 
 function wireDashboard() {
@@ -303,14 +347,11 @@ function renderUploadPanel() {
             <button class="btn sm" id="browse-annotations" type="button">Browse…</button>
             ${uploadState.annotationsPath ? `<button class="btn sm" id="clear-annotations" type="button">Clear</button>` : ""}
           </div>
-          <p class="faint" style="margin-top:4px;">
-            Supports Pascal VOC XML, this app's JSON, LabelMe JSON, one dataset-wide COCO JSON
-            manifest, YOLO .txt (reads classes.txt / obj.names / data.yaml for names), and raw
-            detector/OCR output ({boxes:[{bbox,confidence}]}) — those import as unlabeled boxes
-            since detector output has no class names, ready for a labeler to name each one.
-            Matching ignores subfolders — a file anywhere in this folder with the same
-            filename (minus extension) as an image is used for it.
-          </p>
+          <ul class="hint-list" style="margin-top:8px;">
+            <li><strong>Formats:</strong> Pascal VOC XML, this app's own JSON, LabelMe JSON, one dataset-wide COCO JSON manifest, and YOLO .txt (reads classes.txt / obj.names / data.yaml for names).</li>
+            <li><strong>Detector/OCR output</strong> (<span class="mono">{boxes:[{bbox,confidence}]}</span>) imports as unlabeled boxes — no class names in the source, so a labeler names each one.</li>
+            <li><strong>Matching:</strong> ignores subfolders — any file with the same filename (minus extension) as an image is used for it.</li>
+          </ul>
         </div>
         <button class="btn primary" id="import-btn" ${uploadState.datasetPath ? "" : "disabled"} ${uploadState.importing ? "disabled" : ""}>
           ${uploadState.importing ? "Importing…" : "Import dataset"}
@@ -415,15 +456,20 @@ function renderImagesPanel() {
 
 function renderImageRows() {
   if (!imagesPage.images.length) return `<p class="faint">No images match.</p>`;
-  return `<div class="image-grid">` + imagesPage.images.map((img) => `
+  // Sequence number reflects each image's position across the whole
+  // filtered/sorted list (offset + index), matching the "X–Y of Z" pager
+  // text below -- not just 1..N restarting on every page, which would be
+  // confusing to cross-reference against that same pager.
+  return `<div class="image-grid">` + imagesPage.images.map((img, i) => `
     <div class="image-card ${img.status === "COMPLETED" ? "completed" : ""}" data-id="${img.id}">
       <div class="image-card-thumb">
         <img src="/api/image/${img.id}/file" loading="lazy" alt="" />
+        <span class="image-card-seq">#${imagesPage.offset + i + 1}</span>
         <span class="badge ${img.status === "COMPLETED" ? "green" : img.status === "CLAIMED" ? "amber" : "gray"}">${img.status.toLowerCase()}</span>
       </div>
       <div class="image-card-meta">
         <div class="name" title="${escAttr(img.fileName)}">${img.fileName}</div>
-        <div class="faint">${img.width}×${img.height} · ${img.annotationCount} shape(s)</div>
+        <div class="faint" style="margin-top:3px;">${img.width}×${img.height} · ${img.annotationCount} shape(s)</div>
       </div>
     </div>`).join("") + `</div>`;
 }
@@ -529,70 +575,147 @@ function refreshLabelsPanel() {
 }
 
 // ---------------- export panel ----------------
+// A single "Export" button + modal (askBulkExport, below) replaces what used
+// to be 5 separate format buttons plus a standalone checkbox and two dense
+// explanation paragraphs -- the format-specific details (what each format
+// carries, its fixed coordinate convention, etc.) now live as inline notes
+// next to each choice inside the modal itself, where they're read exactly
+// once, right when they matter, instead of permanently taking up space here.
 function renderExportPanel() {
   return `
     <section id="export-panel" class="card" style="padding:16px;">
       <h2>Export</h2>
-      <div class="stack">
-        <label class="faint row"><input type="checkbox" id="completed-only" /> Completed images only</label>
-        <p class="faint">
-          Checked: only images someone has explicitly finished with Save &amp; Mark Complete.
-          Unchecked: every image that has any shapes at all — a human's saved work where that
-          exists, otherwise whatever the pre-annotation import found, untouched. Either way,
-          an image with zero shapes gets no file.
-        </p>
-        <p class="faint">
-          JSON and XML are this app's own formats (round-trip losslessly, including polygons
-          and manual line numbers). VOC, COCO, and YOLO are for other tools: VOC has no polygon
-          concept, so polygon shapes export as their bounding box; COCO and YOLO both require a
-          class per shape, so any shape with no label is left out of those two (counted in the
-          download). COCO's download is one combined manifest, not a zip — that's how COCO is
-          normally consumed.
-        </p>
-        <div class="row">
-          <a class="btn sm" href="#" data-export="json">⬇ JSON (zip)</a>
-          <a class="btn sm" href="#" data-export="xml">⬇ XML (zip)</a>
-          <a class="btn sm" href="#" data-export="voc">⬇ VOC (zip)</a>
-          <a class="btn sm" href="#" data-export="coco">⬇ COCO (json)</a>
-          <a class="btn sm" href="#" data-export="yolo">⬇ YOLO (zip)</a>
-        </div>
-      </div>
+      <ul class="hint-list">
+        <li><strong>JSON / XML</strong> are this app's own formats — the only two that round-trip losslessly (polygons, manual line numbers included) and let you choose a coordinate system.</li>
+        <li><strong>VOC / COCO / YOLO</strong> are for other tools, each with one fixed coordinate convention by spec — see the note next to each when you export.</li>
+      </ul>
+      <button id="open-export-modal" class="btn primary" type="button" style="margin-top:14px; width:100%;">
+        <svg viewBox="0 0 24 24" fill="none" width="15" height="15"><path d="M12 3v11m0 0l-4.5-4.5M12 14l4.5-4.5M4 20h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export images
+      </button>
     </section>`;
 }
 
 function wireExportPanel() {
-  document.querySelectorAll("#export-panel [data-export]").forEach((a) => {
-    a.addEventListener("click", async (e) => {
-      e.preventDefault();
-      const format = a.dataset.export;
-      // Only this app's own two formats have a coordinate system to choose
-      // between -- see askExportCoords() in canvas.js.
-      let coords = null;
-      if (format === "json" || format === "xml") {
-        coords = await askExportCoords();
-        if (!coords) return; // cancelled
-      }
-      const completedOnly = $("#completed-only").checked;
-      const params = new URLSearchParams();
-      if (completedOnly) params.set("completedOnly", "true");
-      if (coords) params.set("coords", coords);
-      const qs = params.toString();
-      window.location.href = `/api/admin/export/${format}${qs ? `?${qs}` : ""}`;
-    });
+  $("#open-export-modal").addEventListener("click", async () => {
+    const choice = await askBulkExport();
+    if (!choice) return; // cancelled
+    const params = new URLSearchParams();
+    if (choice.completedOnly) params.set("completedOnly", "true");
+    // Coordinate system only means anything for this app's own json/xml
+    // formats -- VOC/COCO/YOLO each have exactly one convention fixed by
+    // their own spec, so the param is simply omitted for those (the server
+    // ignores it either way, but there's no reason to send a value the
+    // dialog itself just marked "fixed" and disabled).
+    if (choice.coords && (choice.format === "json" || choice.format === "xml")) params.set("coords", choice.coords);
+    const qs = params.toString();
+    window.location.href = `/api/admin/export/${choice.format}${qs ? `?${qs}` : ""}`;
   });
 }
 
-// ---------------- users panel ----------------
-function renderUsersPanel() {
-  const users = state.users || [];
-  return `
-    <section class="card" style="padding:16px;">
-      <h2>Labelers</h2>
-      ${users.length ? users.map((u) => `
-        <div class="row" style="justify-content:space-between; padding:5px 0;">
-          <span>${u.name}</span><span class="faint">${timeAgo(u.lastSeenAt)}</span>
-        </div>`).join("") : `<p class="faint">No one has joined yet.</p>`}
-    </section>`;
+/**
+ * Bulk-export modal: format (json/xml/voc/coco/yolo) + coordinate system
+ * (only meaningful for json/xml -- auto-disabled and replaced with a "fixed
+ * by format" note for the other three, same reasoning as askExportCoords()
+ * in canvas.js) + completed-only. Resolves to {format, coords, completedOnly}
+ * or null if cancelled (Esc, backdrop dismissal, or the Cancel button).
+ *
+ * Shared by the dashboard's "Export images" button (every image in the
+ * project, so completedOnly is a real choice) and the per-image editor's
+ * "Export" button (a single, already-open image, where completedOnly is
+ * meaningless -- pass showCompletedOnly: false to omit that toggle entirely
+ * rather than showing a checkbox with no effect).
+ */
+function askBulkExport({ title = "Export images", showCompletedOnly = true } = {}) {
+  const FORMATS = [
+    { value: "json", label: "JSON", desc: "This app's own schema — round-trips back in as a pre-annotation import", coordsFixed: null },
+    { value: "xml", label: "XML", desc: "Same content as JSON, in XML form", coordsFixed: null },
+    { value: "voc", label: "Pascal VOC", desc: "Standard VOC XML for other tools — polygons degrade to their bounding box", coordsFixed: "Fixed: pixel (absolute), by the VOC spec" },
+    { value: "coco", label: "COCO", desc: "One combined manifest for the whole project, not a zip — shapes with no label are left out", coordsFixed: "Fixed: pixel (absolute), by the COCO spec" },
+    { value: "yolo", label: "YOLO", desc: "class_id cx cy w h per line, plus a shared classes.txt — shapes with no label are left out", coordsFixed: "Fixed: normalized, by the YOLO spec" },
+  ];
+  return new Promise((resolve) => {
+    const dlg = document.createElement("dialog");
+    dlg.className = "export-coords-dialog bulk-export-dialog";
+    dlg.innerHTML = `
+      <form method="dialog">
+        <h3>${title}</h3>
+        <p class="faint">Choose a format and, for JSON/XML, a coordinate system.</p>
+
+        <div class="section-title" style="margin-top:14px;">Format</div>
+        <div class="coord-choice" id="bx-format">
+          ${FORMATS.map((f, i) => `
+            <label><input type="radio" name="format" value="${f.value}" ${i === 0 ? "checked" : ""} />
+              <span><strong>${f.label}</strong><br><span class="faint">${f.desc}</span></span></label>`).join("")}
+        </div>
+
+        <div class="section-title" style="margin-top:14px;">Coordinates</div>
+        <div class="coord-choice" id="bx-coords">
+          <label><input type="radio" name="coords" value="normalized" />
+            <span><strong>Normalized</strong><br><span class="faint">0–1, independent of image size</span></span></label>
+          <label><input type="radio" name="coords" value="pixel" />
+            <span><strong>Absolute</strong><br><span class="faint">actual x / y / width / height</span></span></label>
+          <label><input type="radio" name="coords" value="both" checked />
+            <span><strong>Both</strong><br><span class="faint">carries either, larger file</span></span></label>
+        </div>
+        <p class="faint" id="bx-coords-fixed" style="display:none; margin-top:6px;"></p>
+
+        ${showCompletedOnly ? `
+        <label class="row toggle-row" style="margin-top:14px;">
+          <input type="checkbox" id="bx-completed-only" />
+          <span>Completed images only</span>
+        </label>` : ""}
+
+        <div class="row" style="justify-content:flex-end; margin-top:18px; gap:8px;">
+          <button type="button" class="btn" data-act="cancel">Cancel</button>
+          <button type="submit" class="btn primary">Download</button>
+        </div>
+      </form>`;
+    document.body.appendChild(dlg);
+
+    const formatChoice = dlg.querySelector("#bx-format");
+    const coordsChoice = dlg.querySelector("#bx-coords");
+    const coordsFixedNote = dlg.querySelector("#bx-coords-fixed");
+
+    const syncActive = (el) => el.querySelectorAll("label").forEach((l) => l.classList.toggle("active", l.querySelector("input").checked));
+
+    function syncCoordsAvailability() {
+      const format = formatChoice.querySelector('input[name="format"]:checked').value;
+      const meta = FORMATS.find((f) => f.value === format);
+      const disabled = Boolean(meta.coordsFixed);
+      coordsChoice.querySelectorAll("input").forEach((inp) => { inp.disabled = disabled; });
+      coordsChoice.style.opacity = disabled ? ".45" : "1";
+      coordsFixedNote.style.display = disabled ? "block" : "none";
+      coordsFixedNote.textContent = meta.coordsFixed || "";
+      syncActive(coordsChoice);
+    }
+
+    formatChoice.addEventListener("change", () => { syncActive(formatChoice); syncCoordsAvailability(); });
+    coordsChoice.addEventListener("change", () => syncActive(coordsChoice));
+    syncActive(formatChoice);
+    syncCoordsAvailability();
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+      dlg.remove();
+    };
+    dlg.querySelector('[data-act="cancel"]').addEventListener("click", () => { dlg.close(); finish(null); });
+    dlg.querySelector("form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const completedOnlyEl = dlg.querySelector("#bx-completed-only");
+      finish({
+        format: formatChoice.querySelector('input[name="format"]:checked').value,
+        coords: coordsChoice.querySelector('input[name="coords"]:checked').value,
+        completedOnly: completedOnlyEl ? completedOnlyEl.checked : false,
+      });
+    });
+    dlg.addEventListener("cancel", () => finish(null)); // Esc key
+    dlg.addEventListener("close", () => finish(null));  // any other dismissal path
+    dlg.showModal();
+  });
 }
 
 // ---------------- per-image editor (admin can edit/complete/reopen any image) ----------------
@@ -630,13 +753,10 @@ async function openEditor(imageId) {
           <button id="save" class="btn" style="width:100%">Save</button>
           <button id="complete" class="btn primary" style="width:100%">Save &amp; Mark Complete</button>
           ${image.status === "COMPLETED" ? `<button id="reopen" class="btn sm" style="width:100%">Reopen</button>` : ""}
-          <div class="export-grid">
-            <button type="button" class="btn sm" data-coords-export="json">⬇ JSON</button>
-            <button type="button" class="btn sm" data-coords-export="xml">⬇ XML</button>
-            <a class="btn sm" href="/api/admin/export/voc/${image.id}">⬇ VOC</a>
-            <a class="btn sm" href="/api/admin/export/coco/${image.id}">⬇ COCO</a>
-            <a class="btn sm" href="/api/admin/export/yolo/${image.id}">⬇ YOLO</a>
-          </div>
+          <button type="button" id="export-image-btn" class="btn sm" style="width:100%;">
+            <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M12 3v11m0 0l-4.5-4.5M12 14l4.5-4.5M4 20h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Export
+          </button>
         </div>
         <div>
           <div class="section-title">Tools</div>
@@ -647,6 +767,10 @@ async function openEditor(imageId) {
           </div>
         </div>
         <div class="stack" style="margin-top:0;">
+          <label class="row toggle-row" title="Draw a freeform loop over several shapes to give them all the same line number -- fixes line numbers on a skewed page where the automatic top-to-bottom grouping guesses wrong">
+            <input type="checkbox" id="line-annotation-tool" />
+            <span>Line annotation<span class="kbd-badge">⇧Z</span></span>
+          </label>
           <label class="row toggle-row">
             <input type="checkbox" id="show-line-numbers" />
             <span>Show line &amp; sequence numbers</span>
@@ -670,6 +794,7 @@ async function openEditor(imageId) {
             <li><kbd>Shift</kbd>+<kbd>A</kbd> Select tool</li>
             <li><kbd>Shift</kbd>+<kbd>S</kbd> Box tool</li>
             <li><kbd>Shift</kbd>+<kbd>D</kbd> Polygon tool</li>
+            <li><kbd>Shift</kbd>+<kbd>Z</kbd> Toggle line annotation tool</li>
             <li><kbd>Ctrl</kbd>+scroll Zoom</li>
             <li>Scroll Pan (vertical)</li>
             <li><kbd>Shift</kbd>+scroll Pan (horizontal)</li>
@@ -696,8 +821,10 @@ async function openEditor(imageId) {
     onChange: () => { refreshMeta(); renderShapesList(); },
   });
   activeCanvas = canvas;
-  canvas.load(`/api/image/${image.id}/file`, image.width, image.height, image.annotations);
+  canvas.load(`/api/image/${image.id}/file`, image.width, image.height, image.annotations, image.lineRegions);
   $("#holder .anno-canvas").classList.add("select");
+  const lineAnnoChk = $("#line-annotation-tool");
+  lineAnnoChk.addEventListener("change", () => selectTool(lineAnnoChk.checked ? "line-lasso" : "select"));
   const showLinesChk = $("#show-line-numbers");
   showLinesChk.checked = canvas.showLineNumbers;
   showLinesChk.addEventListener("change", () => canvas.setShowLineNumbers(showLinesChk.checked));
@@ -768,22 +895,23 @@ async function openEditor(imageId) {
   document.querySelectorAll("[data-tool]").forEach((b) => {
     b.addEventListener("click", () => selectTool(b.dataset.tool));
   });
-  // JSON/XML support a coordinate-system choice (normalized/pixel/both), so
-  // they're buttons that ask first, not plain download links -- VOC/COCO/
-  // YOLO stay plain <a> links since their coordinate convention is fixed.
-  document.querySelectorAll("[data-coords-export]").forEach((b) => {
-    b.addEventListener("click", async () => {
-      const coords = await askExportCoords();
-      if (!coords) return; // cancelled
-      window.location.href = `/api/admin/export/${b.dataset.coordsExport}/${image.id}?coords=${coords}`;
-    });
+  // Same format + coordinate-system modal as the dashboard's bulk "Export
+  // images" button (askBulkExport, defined above) -- just scoped to this
+  // one already-open image, so there's no completed-only toggle to show.
+  $("#export-image-btn").addEventListener("click", async () => {
+    const choice = await askBulkExport({ title: "Export this image", showCompletedOnly: false });
+    if (!choice) return; // cancelled
+    const params = new URLSearchParams();
+    if (choice.coords && (choice.format === "json" || choice.format === "xml")) params.set("coords", choice.coords);
+    const qs = params.toString();
+    window.location.href = `/api/admin/export/${choice.format}/${image.id}${qs ? `?${qs}` : ""}`;
   });
 
   async function doSave(markComplete) {
     try {
       await api(`/api/admin/image/${image.id}/save`, {
         method: "POST",
-        body: JSON.stringify({ annotations: canvas.getAnnotations(), markComplete }),
+        body: JSON.stringify({ annotations: canvas.getAnnotations(), lineRegions: canvas.getLineRegions(), markComplete }),
       });
       canvas.markSaved();
       await refreshState();

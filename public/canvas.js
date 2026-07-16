@@ -148,13 +148,21 @@ class AnnotationCanvas {
     // floating UI
     this.labelEditor = null;
     this.lineChip = null;
+    this.regionChip = null;
 
     this.img = null;
     this.imgW = 0; this.imgH = 0;
     this.view = { scale: 1, x: 0, y: 0 };
     this.tool = "select";
     this.annotations = [];
+    // Line-annotation regions: freeform "lasso" polygons that fix line
+    // numbers on a skewed page (see lib/lines.js computeLineNumbers) -- a
+    // separate collection from annotations since they aren't shapes (no
+    // label, never exported as their own object), just a persistent record
+    // of "everything in here is line N".
+    this.lineRegions = [];
     this.selectedId = null;
+    this.selectedRegionId = null;
     this.pendingLabelId = null;
     this.activeLabelId = null;
     this.highlightLabelId = null; // set via toggleHighlightLabel() from the Labels sidebar
@@ -172,10 +180,11 @@ class AnnotationCanvas {
   }
 
   // ---------- lifecycle ----------
-  load(imageUrl, width, height, annotations) {
+  load(imageUrl, width, height, annotations, lineRegions) {
     this.imgW = width; this.imgH = height;
     this.annotations = (annotations || []).map((a) => ({ ...a }));
-    this.selectedId = null; this.pendingLabelId = null; this.highlightLabelId = null;
+    this.lineRegions = (lineRegions || []).map((r) => ({ ...r, points: (r.points || []).map((p) => ({ ...p })) }));
+    this.selectedId = null; this.selectedRegionId = null; this.pendingLabelId = null; this.highlightLabelId = null;
     this.undoStack = []; this.redoStack = [];
     this.dirty = false;
     this._closeEditors();
@@ -187,12 +196,13 @@ class AnnotationCanvas {
   }
 
   getAnnotations() { return this.annotations; }
+  getLineRegions() { return this.lineRegions; }
   /** Every shape in on-canvas L<line>-<seq> order, with its label resolved
    *  to a name/color -- for a sidebar "Shapes" list. Same computeLineNumbers
    *  + sort as lib/exporter.js's orderedShapes(), so the list, the canvas
    *  tags, and the export all agree on ordering. */
   getShapesSummary() {
-    const info = LFLines.computeLineNumbers(this.annotations);
+    const info = LFLines.computeLineNumbers(this.annotations, this.lineRegions);
     return this.annotations
       .map((a) => {
         const i = info.get(a.id) || { line: 1, seq: 1 };
@@ -203,7 +213,21 @@ class AnnotationCanvas {
   }
   isDirty() { return this.dirty; }
   markSaved() { this.dirty = false; this.opts.onChange && this.opts.onChange(); }
-  setTool(t) { this.tool = t; this._cancelPolygon(); this.draw(); }
+  setTool(t) {
+    this.tool = t;
+    this._cancelPolygon();
+    this._cancelLasso();
+    // Regions are only visible/selectable while the "line-lasso" tool itself
+    // is active (see draw()'s render gate + _onDown's tool branches) -- so
+    // leaving that tool needs to drop any region selection and close its
+    // chip, rather than leaving a selection that references something about
+    // to visually disappear.
+    if (t !== "line-lasso" && this.selectedRegionId) {
+      this.selectedRegionId = null;
+      if (this.regionChip) { this.regionChip.remove(); this.regionChip = null; }
+    }
+    this.draw();
+  }
   setActiveLabel(id) { this.activeLabelId = id; }
   setShowLineNumbers(v) {
     this.showLineNumbers = Boolean(v);
@@ -236,6 +260,7 @@ class AnnotationCanvas {
     const a = this.annotations.find((x) => x.id === id);
     if (!a) return;
     this.selectedId = id;
+    this.selectedRegionId = null;
     this.pendingLabelId = null; // this is "look at an existing shape", never "name a brand-new one"
     this._revealIfOffscreen(a);
     this._syncEditors();
@@ -251,6 +276,15 @@ class AnnotationCanvas {
   deleteAnnotation(id) {
     if (this.selectedId === id) { this.selectedId = null; this.pendingLabelId = null; this._closeEditors(); }
     this._mutate(this.annotations.filter((a) => a.id !== id));
+  }
+
+  /** Delete a line-annotation region. Shapes it was covering simply fall
+   *  back to whatever line they'd otherwise have (their own manual override,
+   *  or the automatic y-position line) -- deleting a region never deletes or
+   *  otherwise touches the shapes themselves. */
+  deleteRegion(id) {
+    if (this.selectedRegionId === id) { this.selectedRegionId = null; this._closeEditors(); }
+    this._mutateRegions(this.lineRegions.filter((r) => r.id !== id));
   }
 
   /** Called after a label is deleted server-side (admin's Labels panel,
@@ -309,29 +343,41 @@ class AnnotationCanvas {
   }
 
   // ---------- undo / redo ----------
+  // One combined history for both annotations and lineRegions -- a single
+  // linear undo stack the user experiences as "Ctrl+Z undoes my last
+  // change", whichever collection it touched, rather than two independent
+  // stacks that could desync (e.g. undoing a shape move while a region edit
+  // sits "ahead" of it in a separate history would be confusing and, worse,
+  // could silently drop the region edit entirely).
   _record() {
     const now = Date.now();
     const sameGesture = now - this.lastRecordAt < 400;
     this.lastRecordAt = now;
     this.redoStack = [];
     if (sameGesture && this.undoStack.length) return;
-    this.undoStack.push(this.annotations.map((a) => ({ ...a })));
+    this.undoStack.push({
+      annotations: this.annotations.map((a) => ({ ...a })),
+      lineRegions: this.lineRegions.map((r) => ({ ...r, points: r.points.map((p) => ({ ...p })) })),
+    });
     if (this.undoStack.length > 100) this.undoStack.shift();
   }
   _mutate(next) { this._record(); this.annotations = next; this.dirty = true; this.opts.onChange && this.opts.onChange(); this.draw(); }
+  _mutateRegions(next) { this._record(); this.lineRegions = next; this.dirty = true; this.opts.onChange && this.opts.onChange(); this.draw(); }
   undo() {
     const prev = this.undoStack.pop();
     if (!prev) return;
-    this.redoStack.push(this.annotations);
-    this.annotations = prev; this.selectedId = null; this.pendingLabelId = null;
+    this.redoStack.push({ annotations: this.annotations, lineRegions: this.lineRegions });
+    this.annotations = prev.annotations; this.lineRegions = prev.lineRegions;
+    this.selectedId = null; this.pendingLabelId = null; this.selectedRegionId = null;
     this.dirty = true; this.lastRecordAt = 0; this._closeEditors();
     this.opts.onChange && this.opts.onChange(); this.draw();
   }
   redo() {
     const next = this.redoStack.pop();
     if (!next) return;
-    this.undoStack.push(this.annotations);
-    this.annotations = next; this.selectedId = null; this.pendingLabelId = null;
+    this.undoStack.push({ annotations: this.annotations, lineRegions: this.lineRegions });
+    this.annotations = next.annotations; this.lineRegions = next.lineRegions;
+    this.selectedId = null; this.pendingLabelId = null; this.selectedRegionId = null;
     this.dirty = true; this.lastRecordAt = 0; this._closeEditors();
     this.opts.onChange && this.opts.onChange(); this.draw();
   }
@@ -364,7 +410,42 @@ class AnnotationCanvas {
       ctx.drawImage(this.img, this.view.x, this.view.y, this.imgW * this.view.scale, this.imgH * this.view.scale);
     }
 
-    const lineInfo = LFLines.computeLineNumbers(this.annotations);
+    const lineInfo = LFLines.computeLineNumbers(this.annotations, this.lineRegions);
+
+    // Line-annotation regions render as a background layer -- a dashed rose
+    // outline + faint fill -- so real shape outlines/handles always stay
+    // crisp on top of them. These aren't shapes: no label, not exported as
+    // their own object, just a persistent visual record of "everything in
+    // here is line N" (see lib/lines.js computeLineNumbers).
+    //
+    // Only drawn (and only selectable -- see _onDown's "line-lasso" branch)
+    // while the Line annotation tool itself is checked/active: toggling it
+    // off hides the loops entirely to declutter the canvas, while the line
+    // numbers they already assigned stay in effect either way -- lineInfo
+    // above was computed from this.lineRegions regardless of this flag, so
+    // hiding the loops never touches what they actually did to any shape.
+    if (this.tool === "line-lasso") {
+      for (const r of this.lineRegions) {
+        if (!r.points || r.points.length < 2) continue;
+        const selR = r.id === this.selectedRegionId;
+        let memberCount = 0;
+        for (const info of lineInfo.values()) if (info.regionId === r.id) memberCount++;
+        ctx.save();
+        ctx.strokeStyle = "#f43f5e"; ctx.lineWidth = selR ? 3 : 2; ctx.setLineDash([7, 5]);
+        ctx.beginPath();
+        const rf = this.toCanvas(r.points[0].x, r.points[0].y);
+        ctx.moveTo(rf.x, rf.y);
+        for (let i = 1; i < r.points.length; i++) { const c = this.toCanvas(r.points[i].x, r.points[i].y); ctx.lineTo(c.x, c.y); }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#f43f5e1a";
+        ctx.fill();
+        ctx.restore();
+        if (selR) this._drawHandles(r.points.map((p) => this.toCanvas(p.x, p.y)), "#f43f5e");
+        this._drawTag(`Line ${r.line} · ${memberCount} shape${memberCount === 1 ? "" : "s"}`, rf.x, rf.y, "#f43f5e");
+      }
+    }
 
     for (const a of this.annotations) {
       const color = this._colorOf(a.labelId);
@@ -426,6 +507,14 @@ class AnnotationCanvas {
       if (this.mouseNorm) { const c = this.toCanvas(this.mouseNorm.x, this.mouseNorm.y); ctx.lineTo(c.x, c.y); }
       ctx.stroke();
       this._drawHandles(d.points.map((p) => this.toCanvas(p.x, p.y)), "#fff");
+    } else if (d.mode === "draw-lasso" && d.points && d.points.length) {
+      ctx.strokeStyle = "#f43f5e"; ctx.lineWidth = 2;
+      ctx.beginPath();
+      const f = this.toCanvas(d.points[0].x, d.points[0].y);
+      ctx.moveTo(f.x, f.y);
+      for (let i = 1; i < d.points.length; i++) { const c = this.toCanvas(d.points[i].x, d.points[i].y); ctx.lineTo(c.x, c.y); }
+      if (this.mouseNorm) { const c = this.toCanvas(this.mouseNorm.x, this.mouseNorm.y); ctx.lineTo(c.x, c.y); }
+      ctx.stroke();
     }
 
     this._positionFloatingUi();
@@ -506,6 +595,18 @@ class AnnotationCanvas {
     }
     return inside;
   }
+  /** Like _hitShape, but for line-annotation regions -- only consulted when
+   *  a click didn't land on a real shape (see _onDown's "select" branch),
+   *  since a shape should always take precedence over the (usually much
+   *  larger) region loosely drawn around it. */
+  _hitRegion(pos) {
+    const n = this.toNorm(pos.x, pos.y);
+    for (let i = this.lineRegions.length - 1; i >= 0; i--) {
+      const r = this.lineRegions[i];
+      if (r.points && r.points.length >= 3 && this._pointInPoly(n, r.points)) return r;
+    }
+    return null;
+  }
 
   // ---------- events ----------
   _bind() {
@@ -563,8 +664,13 @@ class AnnotationCanvas {
         const id = this.selectedId;
         this.selectedId = null; this.pendingLabelId = null; this._closeEditors();
         this._mutate(this.annotations.filter((a) => a.id !== id));
+      } else if ((e.key === "Delete" || e.key === "Backspace") && this.selectedRegionId) {
+        e.preventDefault();
+        const id = this.selectedRegionId;
+        this.selectedRegionId = null; this._closeEditors();
+        this._mutateRegions(this.lineRegions.filter((r) => r.id !== id));
       } else if (e.key === "Escape") {
-        this._cancelPolygon(); this._closeEditors(); this.pendingLabelId = null; this.draw();
+        this._cancelPolygon(); this._cancelLasso(); this._closeEditors(); this.pendingLabelId = null; this.draw();
       } else if (e.key === "Enter" && this.drag.mode === "draw-poly") {
         this._finishPolygon();
       }
@@ -620,6 +726,60 @@ class AnnotationCanvas {
       }
       this.draw();
     }
+    if (this.tool === "line-lasso") {
+      // Regions are only ever visible/selectable while THIS tool is active
+      // (see draw()'s render gate and setTool()'s deselect-on-leave) -- so,
+      // unlike the Select tool (which only ever draws NEW shapes via the
+      // dedicated bbox/polygon tools), this one doubles as both "select an
+      // existing region to move/reshape/delete it" AND "draw a brand new
+      // one", the same way the plain Select tool doubles as select+move for
+      // shapes. _tryPickRegion() tries the former first; only an empty-space
+      // click falls through to starting a new freehand loop.
+      if (this._tryPickRegion(pos)) {
+        this._syncEditors(); this.draw();
+        this.opts.onChange && this.opts.onChange();
+        return;
+      }
+      // A single click-drag-release gesture (unlike the polygon tool's
+      // click-click-click), so it just starts capturing points here --
+      // _onMove appends more as the mouse moves, _onUp finalizes it.
+      const n = this.toNorm(pos.x, pos.y);
+      this.selectedRegionId = null; this._closeEditors();
+      this.drag = { mode: "draw-lasso", points: [{ x: clamp01(n.x), y: clamp01(n.y) }] };
+    }
+  }
+
+  /** Shared by the "line-lasso" tool's mousedown: try to pick up an existing
+   *  region -- first a vertex handle on the CURRENTLY selected one (to
+   *  reshape it), then any region under the cursor at all (to select + drag
+   *  it as a whole). Returns true if it started a drag/selection (caller
+   *  should stop there); false means nothing existing was under the cursor,
+   *  so the caller falls through to starting a brand new region instead. */
+  _tryPickRegion(pos) {
+    const selRegion = this.lineRegions.find((r) => r.id === this.selectedRegionId);
+    if (selRegion) {
+      const hv = this._hitRegionVertex(selRegion, pos);
+      if (hv != null) { this.drag = { mode: "reshape-region", id: selRegion.id, pointIndex: hv }; return true; }
+    }
+    const hitRegion = this._hitRegion(pos);
+    if (hitRegion) {
+      this.selectedId = null; this.pendingLabelId = null;
+      this.selectedRegionId = hitRegion.id;
+      this.drag = { mode: "move-region", id: hitRegion.id, origin: this.toNorm(pos.x, pos.y), orig: hitRegion.points.map((p) => ({ ...p })) };
+      return true;
+    }
+    return false;
+  }
+
+  /** Index of the region point under the cursor (within resize-handle
+   *  tolerance), or null -- same 8px hit radius as _hitHandle uses for bbox
+   *  handles, so dragging a region vertex feels exactly as forgiving. */
+  _hitRegionVertex(region, pos) {
+    for (let i = 0; i < region.points.length; i++) {
+      const c = this.toCanvas(region.points[i].x, region.points[i].y);
+      if (Math.abs(pos.x - c.x) <= 8 && Math.abs(pos.y - c.y) <= 8) return i;
+    }
+    return null;
   }
 
   _onMove(e) {
@@ -631,6 +791,40 @@ class AnnotationCanvas {
       this.draw(); return;
     }
     if (d.mode === "draw-bbox" || d.mode === "draw-poly") { this.draw(); return; }
+    if (d.mode === "draw-lasso") {
+      // Sparse-sample the freehand path: only record a new point once the
+      // cursor has moved a few canvas pixels from the last one, so a slow
+      // drag doesn't pile up thousands of near-duplicate points. Distance is
+      // measured in CANVAS pixels (not normalized image units) so the
+      // sampling density stays visually consistent regardless of zoom level.
+      const last = d.points[d.points.length - 1];
+      const lastCanvas = this.toCanvas(last.x, last.y);
+      if (Math.hypot(pos.x - lastCanvas.x, pos.y - lastCanvas.y) >= 4) {
+        d.points.push({ x: clamp01(this.mouseNorm.x), y: clamp01(this.mouseNorm.y) });
+      }
+      this.draw();
+      return;
+    }
+    if (d.mode === "move-region") {
+      const dx = this.mouseNorm.x - d.origin.x, dy = this.mouseNorm.y - d.origin.y;
+      const xs = d.orig.map((p) => p.x), ys = d.orig.map((p) => p.y);
+      const cdx = Math.max(-Math.min(...xs), Math.min(1 - Math.max(...xs), dx));
+      const cdy = Math.max(-Math.min(...ys), Math.min(1 - Math.max(...ys), dy));
+      const pts = d.orig.map((p) => ({ x: p.x + cdx, y: p.y + cdy }));
+      this._mutateRegions(this.lineRegions.map((r) => (r.id === d.id ? { ...r, points: pts } : r)));
+      return;
+    }
+    if (d.mode === "reshape-region") {
+      // Drags a single vertex -- shape membership (>50% area inside) is
+      // recomputed fresh on every draw(), so reshaping the region live
+      // updates which bboxes/polygons it covers with no extra bookkeeping.
+      const n = { x: clamp01(this.mouseNorm.x), y: clamp01(this.mouseNorm.y) };
+      this._mutateRegions(this.lineRegions.map((r) => {
+        if (r.id !== d.id) return r;
+        return { ...r, points: r.points.map((p, i) => (i === d.pointIndex ? n : p)) };
+      }));
+      return;
+    }
     if (d.mode === "move") {
       const a = this.annotations.find((x) => x.id === d.id);
       if (!a) return;
@@ -681,6 +875,7 @@ class AnnotationCanvas {
         this._syncEditors();
       }
     }
+    if (d.mode === "draw-lasso") { this._finishLasso(); return; }
     if (d.mode !== "draw-poly") this.drag = { mode: "none" };
     this.draw();
   }
@@ -695,11 +890,33 @@ class AnnotationCanvas {
     this._syncEditors();
   }
   _cancelPolygon() { if (this.drag.mode === "draw-poly") this.drag = { mode: "none" }; }
+  _cancelLasso() { if (this.drag.mode === "draw-lasso") this.drag = { mode: "none" }; }
+
+  /** Finalizes a freehand line-annotation region: needs at least 3 points to
+   *  be a real polygon (fewer is treated as a stray click/tiny accidental
+   *  drag and just discarded). The new region's line number defaults to one
+   *  past whatever the highest region line currently is -- "starting from 1
+   *  and so on" for the first region on a fresh image, continuing on from
+   *  there for subsequent ones -- and is immediately editable via the
+   *  floating chip _syncEditors() opens for it (see _openRegionChip). */
+  _finishLasso() {
+    const d = this.drag;
+    this.drag = { mode: "none" };
+    if (!d.points || d.points.length < 3) { this.draw(); return; }
+    const points = d.points.map((p) => ({ x: clamp01(p.x), y: clamp01(p.y) }));
+    const nextLine = this.lineRegions.reduce((m, r) => Math.max(m, r.line), 0) + 1;
+    const region = { id: uuid(), points, line: nextLine };
+    this._mutateRegions([...this.lineRegions, region]);
+    this.selectedId = null; this.pendingLabelId = null;
+    this.selectedRegionId = region.id;
+    this._syncEditors();
+  }
 
   // ---------- floating label editor + line chip ----------
   _closeEditors() {
     if (this.labelEditor) { this.labelEditor.remove(); this.labelEditor = null; }
     if (this.lineChip) { this.lineChip.remove(); this.lineChip = null; }
+    if (this.regionChip) { this.regionChip.remove(); this.regionChip = null; }
   }
 
   _syncEditors() {
@@ -712,6 +929,8 @@ class AnnotationCanvas {
     if (pending && this.showLabelInput) this._openLabelEditor(pending);
     const sel = this.annotations.find((a) => a.id === this.selectedId);
     if (sel) this._openLineChip(sel);
+    const selRegion = this.lineRegions.find((r) => r.id === this.selectedRegionId);
+    if (selRegion) this._openRegionChip(selRegion);
   }
 
   /** Top-center or bottom-center anchor point of a shape, in canvas
@@ -728,6 +947,16 @@ class AnnotationCanvas {
     return where === "below"
       ? this.toCanvas(xs.reduce((s, v) => s + v, 0) / xs.length, Math.max(...ys))
       : this.toCanvas(xs.reduce((s, v) => s + v, 0) / xs.length, Math.min(...ys));
+  }
+
+  /** Top-center or bottom-center anchor point of a region's bounding box, in
+   *  canvas coordinates -- same idea as _anchor() above but for a region's
+   *  raw points array rather than an annotation object. */
+  _regionAnchor(r, where) {
+    const xs = r.points.map((p) => p.x), ys = r.points.map((p) => p.y);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const y = where === "below" ? Math.max(...ys) : Math.min(...ys);
+    return this.toCanvas(cx, y);
   }
 
   _positionFloatingUi() {
@@ -804,6 +1033,29 @@ class AnnotationCanvas {
         }
         this.labelEditor.style.left = left + "px";
         this.labelEditor.style.top = top + "px";
+      }
+    }
+
+    // Region chip: same above-with-below-fallback placement as the line
+    // chip, anchored to the region's own bounding box instead of a shape's.
+    // Never open at the same time as the line chip or label editor (regions
+    // and shapes are mutually exclusive selections), so no overlap-avoidance
+    // against those is needed here.
+    if (this.regionChip) {
+      const r = this.lineRegions.find((x) => x.id === this.selectedRegionId);
+      if (r) {
+        const w = this.regionChip.offsetWidth || 190, h = this.regionChip.offsetHeight || 30;
+        const above = this._regionAnchor(r, "above");
+        let left = Math.max(4, Math.min(cw - w - 4, above.x - w / 2));
+        let top = above.y - h - CHIP_GAP;
+        if (top < 4) {
+          const below = this._regionAnchor(r, "below");
+          left = Math.max(4, Math.min(cw - w - 4, below.x - w / 2));
+          top = below.y + CHIP_GAP;
+        }
+        top = Math.max(4, Math.min(ch - h - 4, top));
+        this.regionChip.style.left = left + "px";
+        this.regionChip.style.top = top + "px";
       }
     }
   }
@@ -904,27 +1156,73 @@ class AnnotationCanvas {
   }
 
   _openLineChip(annotation) {
-    const info = LFLines.computeLineNumbers(this.annotations).get(annotation.id);
+    const info = LFLines.computeLineNumbers(this.annotations, this.lineRegions).get(annotation.id);
     if (!info) return;
     const el = document.createElement("div");
     el.className = "line-chip";
-    el.innerHTML = `<span>Line</span><input type="number" min="1" value="${info.line}" />
-      <button type="button" class="${info.isManual ? "manual" : "auto"}" title="${info.isManual ? `Back to automatic (would be line ${info.autoLine})` : "Automatic from y-position — type a number to override"}">auto</button>`;
+    // A shape currently covered by a line-annotation region (>50% of its
+    // area, see lib/lines.js) has its line number governed by that region,
+    // not by this per-shape override -- typing a number here would just get
+    // silently overwritten again on the next recompute. Rather than let that
+    // happen invisibly, the input is disabled with an explanatory note
+    // pointing at the region instead (same "explain why, don't just block"
+    // pattern as the export modal's fixed-coordinate notes).
+    if (info.isRegion) {
+      el.innerHTML = `<span>Line ${info.line}</span><span class="faint">set by a line-annotation region — select it to change</span>`;
+    } else {
+      el.innerHTML = `<span>Line</span><input type="number" min="1" value="${info.line}" />
+        <button type="button" class="${info.isManual ? "manual" : "auto"}" title="${info.isManual ? `Back to automatic (would be line ${info.autoLine})` : "Automatic from y-position — type a number to override"}">auto</button>`;
+    }
     el.addEventListener("mousedown", (e) => e.stopPropagation());
     this.container.appendChild(el);
     this.lineChip = el;
+
+    if (!info.isRegion) {
+      const input = el.querySelector("input");
+      input.addEventListener("change", () => {
+        const v = parseInt(input.value, 10);
+        if (isFinite(v) && v >= 1) {
+          this._mutate(this.annotations.map((a) => (a.id === annotation.id ? { ...a, line: v } : a)));
+          this._syncEditors();
+        }
+      });
+      el.querySelector("button").addEventListener("click", () => {
+        this._mutate(this.annotations.map((a) => (a.id === annotation.id ? { ...a, line: null } : a)));
+        this._syncEditors();
+      });
+    }
+    this._positionFloatingUi();
+  }
+
+  /** Floating chip for a selected line-annotation region: change its line
+   *  number (re-sweeps automatically -- computeLineNumbers() is recomputed
+   *  fresh on every draw(), there's no separately-cached membership to go
+   *  stale) or delete the region outright. */
+  _openRegionChip(region) {
+    const info = LFLines.computeLineNumbers(this.annotations, this.lineRegions);
+    let memberCount = 0;
+    for (const i of info.values()) if (i.regionId === region.id) memberCount++;
+    const el = document.createElement("div");
+    el.className = "line-chip region-chip";
+    el.innerHTML = `<span>Line</span><input type="number" min="1" value="${region.line}" />
+      <span class="faint">${memberCount} shape${memberCount === 1 ? "" : "s"}</span>
+      <button type="button" class="danger" title="Delete this region — shapes inside fall back to their own line">Delete</button>`;
+    el.addEventListener("mousedown", (e) => e.stopPropagation());
+    this.container.appendChild(el);
+    this.regionChip = el;
 
     const input = el.querySelector("input");
     input.addEventListener("change", () => {
       const v = parseInt(input.value, 10);
       if (isFinite(v) && v >= 1) {
-        this._mutate(this.annotations.map((a) => (a.id === annotation.id ? { ...a, line: v } : a)));
+        this._mutateRegions(this.lineRegions.map((r) => (r.id === region.id ? { ...r, line: v } : r)));
         this._syncEditors();
       }
     });
     el.querySelector("button").addEventListener("click", () => {
-      this._mutate(this.annotations.map((a) => (a.id === annotation.id ? { ...a, line: null } : a)));
-      this._syncEditors();
+      this.selectedRegionId = null;
+      this._closeEditors();
+      this._mutateRegions(this.lineRegions.filter((r) => r.id !== region.id));
     });
     this._positionFloatingUi();
   }

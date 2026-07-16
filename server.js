@@ -4,11 +4,21 @@
  *
  * Two HTTP listeners against one app (the admin boundary is the NETWORK,
  * not a login):
- *   LAN   0.0.0.0:3000   -- labelers; /admin* and /api/admin* hard-404
- *   Admin 127.0.0.1:3001 -- host machine only (the OS refuses remote
- *                           connections to loopback), full access
+ *   LAN   0.0.0.0:<auto>   -- labelers; /admin* and /api/admin* hard-404
+ *   Admin 127.0.0.1:<you choose> -- host machine only (the OS refuses
+ *                                   remote connections to loopback), full
+ *                                   access
  *
  * Run: node server.js     (no build step, no npm install)
+ *
+ * Interactively (a real terminal), it asks which port to run the admin
+ * panel on, then automatically picks the next free port after that for the
+ * LAN/labeler listener -- see resolveAdminPort()/findAvailablePort() below.
+ * Non-interactively (piped stdin, a process manager, CI, Docker, etc.) it
+ * skips the prompt so startup never blocks on input that will never arrive;
+ * set the ADMIN_PORT and/or PORT environment variables to control the ports
+ * explicitly in that case (both are still honored and take priority over
+ * the interactive prompt/auto-detection either way).
  */
 
 const http = require("node:http");
@@ -16,6 +26,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
 const os = require("node:os");
+const net = require("node:net");
+const readline = require("node:readline");
 
 const store = require("./lib/store");
 const { registerDataset } = require("./lib/importer");
@@ -26,8 +38,11 @@ const {
 const { pickFolder } = require("./lib/dialog");
 const { MIME } = require("./lib/imagesize");
 
-const LAN_PORT = parseInt(process.env.PORT || "3000", 10);
-const ADMIN_PORT = parseInt(process.env.ADMIN_PORT || "3001", 10);
+// Set once resolveAdminPort()/main() run -- see the bottom of this file.
+// (Was previously a fixed pair of top-level consts; now resolved at startup
+// since the admin port can come from a prompt and the LAN port from a
+// port scan, not just env vars.)
+let LAN_PORT, ADMIN_PORT;
 const PUBLIC_DIR = path.join(__dirname, "public");
 const TOKEN_HEADER = "x-user-token";
 
@@ -123,6 +138,23 @@ function validAnnotations(list) {
   return out;
 }
 
+// Line-annotation regions ("lasso" polygons that fix line numbers on a
+// skewed page -- see lib/lines.js). Optional in every save payload: a
+// missing/absent lineRegions key is NOT an error (it just means "no change
+// requested to this image's regions"), unlike annotations which are always
+// a full replace -- see the two call sites below for exactly how each
+// treats a missing key.
+function validLineRegions(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const r of list) {
+    if (Array.isArray(r.points) && r.points.length >= 3 && r.points.every((p) => typeof p.x === "number" && typeof p.y === "number")) {
+      out.push(r);
+    }
+  }
+  return out;
+}
+
 // ---------------- API ----------------
 let folderDialogOpen = false;
 
@@ -175,7 +207,7 @@ async function handleApi(req, res, url, isAdminPort) {
     if (!user) return;
     if (!requireProject(res)) return;
     const { image, resumed } = store.claimNext(user.id, user.name);
-    return json(res, { image: image ? { ...imageSummary(image), annotations: image.annotations } : null, resumed });
+    return json(res, { image: image ? { ...imageSummary(image), annotations: image.annotations, lineRegions: image.lineRegions } : null, resumed });
   }
 
   if (seg[1] === "image" && seg.length === 3 && method === "GET") {
@@ -186,7 +218,7 @@ async function handleApi(req, res, url, isAdminPort) {
     if (image.claimedBy !== user.id && image.status !== "COMPLETED") {
       return fail(res, 403, "This image is not assigned to you");
     }
-    return json(res, { image: { ...imageSummary(image), annotations: image.annotations } });
+    return json(res, { image: { ...imageSummary(image), annotations: image.annotations, lineRegions: image.lineRegions } });
   }
 
   // Manual save: THE sync point -- persists to the admin-side store.
@@ -200,6 +232,14 @@ async function handleApi(req, res, url, isAdminPort) {
     const anns = validAnnotations(body.annotations);
     if (!anns) return fail(res, 400, "annotations must be an array");
     store.replaceAnnotations(image, anns, user.id, user.name);
+    // lineRegions is optional in the payload (a client that doesn't know
+    // about it yet just omits the key) -- only touch existing regions when
+    // the client actually sent a (possibly empty) array.
+    if (body.lineRegions !== undefined) {
+      const regions = validLineRegions(body.lineRegions);
+      if (!regions) return fail(res, 400, "lineRegions must be an array");
+      store.replaceLineRegions(image, regions);
+    }
     if (seg[3] === "complete") store.completeImage(image, user.id, user.name);
     return json(res, { image: imageSummary(image), savedAt: image.savedAt });
   }
@@ -352,7 +392,7 @@ async function handleApi(req, res, url, isAdminPort) {
   if (seg[2] === "image" && seg.length === 4 && method === "GET") {
     const image = store.getImage(seg[3]);
     if (!image) return fail(res, 404, "Image not found");
-    return json(res, { image: { ...imageSummary(image), annotations: image.annotations } });
+    return json(res, { image: { ...imageSummary(image), annotations: image.annotations, lineRegions: image.lineRegions } });
   }
 
   // Admin can annotate any image regardless of claims.
@@ -363,6 +403,11 @@ async function handleApi(req, res, url, isAdminPort) {
     const anns = validAnnotations(body.annotations);
     if (!anns) return fail(res, 400, "annotations must be an array");
     store.replaceAnnotations(image, anns, null, "Admin");
+    if (body.lineRegions !== undefined) {
+      const regions = validLineRegions(body.lineRegions);
+      if (!regions) return fail(res, 400, "lineRegions must be an array");
+      store.replaceLineRegions(image, regions);
+    }
     if (body.markComplete) store.completeImage(image, null, "Admin");
     return json(res, { image: imageSummary(image) });
   }
@@ -515,5 +560,87 @@ process.on("unhandledRejection", (err) => {
   console.error("[server] Unhandled promise rejection (server is still running):", err);
 });
 
-listenOrExplain(http.createServer(makeHandler(false)), LAN_PORT, "0.0.0.0", "LAN");
-listenOrExplain(http.createServer(makeHandler(true)), ADMIN_PORT, "127.0.0.1", "Admin");
+// ---------------- interactive port selection ----------------
+function parsePort(v) {
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n > 0 && n <= 65535 ? n : null;
+}
+
+// Tries to bind `port` on `host` and immediately releases it. This is a
+// point-in-time check only (another process could grab the port a moment
+// later), which is exactly why listenOrExplain()'s EADDRINUSE handling
+// still exists as a backstop -- this just avoids the common case of
+// prompting/auto-picking a port that's obviously already taken.
+function isPortFree(port, host) {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once("error", () => resolve(false));
+    tester.listen(port, host, () => tester.close(() => resolve(true)));
+  });
+}
+
+// Scans upward from startPort (inclusive) for the first free port on host.
+async function findAvailablePort(startPort, host, maxTries = 500) {
+  let port = startPort;
+  for (let i = 0; i < maxTries && port <= 65535; i++, port++) {
+    if (await isPortFree(port, host)) return port;
+  }
+  throw new Error(`Could not find a free port on ${host} starting from ${startPort}`);
+}
+
+function promptLine(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => { rl.close(); resolve(answer); });
+  });
+}
+
+const DEFAULT_ADMIN_PORT = 3001;
+
+// Admin port: explicit env var always wins (scripts, process managers,
+// Docker, and this project's own test scripts all rely on setting
+// ADMIN_PORT/PORT and getting a silent, non-interactive boot). Otherwise,
+// in a real terminal, ask; outside one (piped stdin, a service unit, CI)
+// stdin.isTTY is false and there is no one to answer a prompt, so fall
+// straight through to the default rather than hanging forever on input
+// that will never arrive.
+async function resolveAdminPort() {
+  if (process.env.ADMIN_PORT) {
+    const n = parsePort(process.env.ADMIN_PORT);
+    if (n) return n;
+    console.error(`[server] ADMIN_PORT="${process.env.ADMIN_PORT}" is not a valid port (1-65535); using ${DEFAULT_ADMIN_PORT} instead.`);
+    return DEFAULT_ADMIN_PORT;
+  }
+  if (!process.stdin.isTTY) return DEFAULT_ADMIN_PORT;
+
+  for (;;) {
+    const answer = (await promptLine(`Which port should the admin panel run on? [${DEFAULT_ADMIN_PORT}]: `)).trim();
+    const port = answer === "" ? DEFAULT_ADMIN_PORT : parsePort(answer);
+    if (!port) { console.log(`  "${answer}" isn't a valid port (1-65535). Try again.`); continue; }
+    if (!(await isPortFree(port, "127.0.0.1"))) { console.log(`  Port ${port} is already in use on this machine. Try a different one.`); continue; }
+    return port;
+  }
+}
+
+// LAN/labeler port: explicit PORT env var wins, same rationale as above.
+// Otherwise auto-pick -- the user is only ever asked about the admin port;
+// the labeler port is meant to "just work" -- scanning forward from
+// adminPort + 1 for the first free port on 0.0.0.0 (the interface the LAN
+// listener actually binds).
+async function resolveLanPort(adminPort) {
+  if (process.env.PORT) {
+    const n = parsePort(process.env.PORT);
+    if (n) return n;
+    console.error(`[server] PORT="${process.env.PORT}" is not a valid port (1-65535); auto-selecting one instead.`);
+  }
+  return findAvailablePort(adminPort + 1, "0.0.0.0");
+}
+
+async function main() {
+  ADMIN_PORT = await resolveAdminPort();
+  LAN_PORT = await resolveLanPort(ADMIN_PORT);
+  listenOrExplain(http.createServer(makeHandler(false)), LAN_PORT, "0.0.0.0", "LAN");
+  listenOrExplain(http.createServer(makeHandler(true)), ADMIN_PORT, "127.0.0.1", "Admin");
+}
+
+main();

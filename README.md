@@ -9,16 +9,18 @@ node server.js
 ```
 
 That's it. Two HTTP servers start: one for the people doing the labeling, one
-for the admin.
+for the admin. Run interactively (a real terminal), it asks which port to
+put the admin panel on, then automatically picks the next free port after
+that for the labeler listener — no port-hunting or config file required.
 
 ## Why two ports
 
 LabelFlow's access model is the network, not a login screen.
 
-| Listener | Default port | Reachable from | Who it's for |
+| Listener | Port | Reachable from | Who it's for |
 |---|---|---|---|
-| LAN | `3000` | Anyone on your local network | Labelers — join with just a name |
-| Admin | `3001` | This machine only (loopback) | Whoever is sitting at this computer |
+| LAN | Next free port after the admin port (auto-picked) | Anyone on your local network | Labelers — join with just a name |
+| Admin | You choose at startup (default `3001`) | This machine only (loopback) | Whoever is sitting at this computer |
 
 The admin port refuses connections from anywhere but `localhost`, so there's
 no password to manage — physical/network access to the admin machine *is*
@@ -59,11 +61,22 @@ password) scoped to the LAN port only; they can never reach `/admin*` or
    ```
    node server.js
    ```
-   Optionally set `PORT` (LAN listener, default `3000`) and `ADMIN_PORT`
-   (admin listener, default `3001`) as environment variables.
-2. **Open the admin panel** on the host machine: `http://localhost:3001`.
-   Create a project, then upload a dataset (a folder of images) and,
-   optionally, a separate folder of pre-existing annotations.
+   You'll be asked which port to run the admin panel on (just press
+   Enter to accept the default, `3001`); if that port's already taken
+   you'll be asked again. The labeler/LAN listener isn't something you're
+   asked about — it's picked automatically, starting from the next port
+   after the admin one and scanning forward until a free one is found.
+
+   Running non-interactively (piped stdin, a process manager, Docker, CI)
+   skips the prompt entirely — the admin port falls back to `3001` unless
+   you set the `ADMIN_PORT` environment variable, and the LAN port is
+   still auto-picked unless you set `PORT`. Both environment variables,
+   when set, always take priority over the prompt/auto-detection either
+   way.
+2. **Open the admin panel** on the host machine at whichever URL is
+   printed on startup (`http://localhost:<admin port>`). Create a
+   project, then upload a dataset (a folder of images) and, optionally, a
+   separate folder of pre-existing annotations.
 3. **Share the LAN URL** the server prints on startup with your labelers.
    They open it in a browser, type their name, and start claiming pages.
 
