@@ -40,6 +40,7 @@ input, select { font: inherit; }
 .badge.gray { background: #f1f5f9; color: #475569; }
 .badge.amber { background: #fef3c7; color: #92400e; }
 .badge.green { background: #d1fae5; color: #065f46; }
+.badge.red { background: #fee2e2; color: #991b1b; }
 /* Turns a plain <span> status badge into a real clickable pill (the
    users-pill next to total/unclaimed/claimed/completed) without changing
    how it reads at a glance among the non-interactive ones beside it. */
@@ -266,6 +267,18 @@ dialog::backdrop { background: rgba(15,23,42,.4); }
    look as export-coords-dialog, just wider to comfortably fit a 5-way
    format choice on top of the coordinate choice + completed-only toggle. */
 .bulk-export-dialog { width: 420px; }
+
+/* Unsaved-changes warning dialog (shown before exporting a page with edits
+   that haven't been saved yet -- see canvas.js askUnsavedChanges()). Wider
+   still, since each row needs room for a badge + line/seq + label + a short
+   change description without wrapping awkwardly. */
+.unsaved-changes-dialog { width: 440px; }
+.unsaved-list { list-style: none; margin: 12px 0 0; padding: 0; max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.unsaved-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+.unsaved-row:last-child { border-bottom: none; }
+.unsaved-row.jumpable { cursor: pointer; }
+.unsaved-row.jumpable:hover { background: var(--brand-light); }
+.unsaved-row-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* admin dashboard */
 .admin-grid { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }

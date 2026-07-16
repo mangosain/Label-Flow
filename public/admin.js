@@ -779,6 +779,10 @@ async function openEditor(imageId) {
             <input type="checkbox" id="show-label-input" />
             <span>Show label input box</span>
           </label>
+          <button type="button" id="recalc-lines" class="btn sm" style="width:100%;" title="Clear every manual or pre-annotation line number on this page and reapply the tool's own automatic top-to-bottom numbering (any line-annotation regions you've drawn stay in effect). Undoable with Ctrl/Cmd+Z.">
+            <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Recalculate lines
+          </button>
         </div>
         <div>
           <div class="section-title">Labels</div>
@@ -899,12 +903,31 @@ async function openEditor(imageId) {
   // images" button (askBulkExport, defined above) -- just scoped to this
   // one already-open image, so there's no completed-only toggle to show.
   $("#export-image-btn").addEventListener("click", async () => {
+    // Export always reads from the server's last-saved copy, never straight
+    // off the canvas -- so unsaved edits here would silently export stale
+    // numbers. askUnsavedChanges shows exactly what's unsaved (and where) and
+    // lets the user save first instead of finding out after the fact.
+    if (canvas.isDirty()) {
+      const decision = await askUnsavedChanges(canvas);
+      if (decision === "cancel") return;
+      if (decision === "save") {
+        await doSave(false);
+        if (canvas.isDirty()) return; // save failed -- doSave already toasted the error
+      }
+    }
     const choice = await askBulkExport({ title: "Export this image", showCompletedOnly: false });
     if (!choice) return; // cancelled
     const params = new URLSearchParams();
     if (choice.coords && (choice.format === "json" || choice.format === "xml")) params.set("coords", choice.coords);
     const qs = params.toString();
     window.location.href = `/api/admin/export/${choice.format}/${image.id}${qs ? `?${qs}` : ""}`;
+  });
+  $("#recalc-lines").addEventListener("click", () => {
+    const n = canvas.countManualLineOverrides();
+    if (!n) { showToast("Every shape on this page is already automatic — nothing to recalculate."); return; }
+    if (!confirm(`Recalculate line & sequence numbers for this page?\n\nThis clears ${n} manual or pre-annotation line number${n === 1 ? "" : "s"} and reapplies the tool's automatic top-to-bottom numbering. Any line-annotation regions you've drawn stay in effect. You can undo this with Ctrl/Cmd+Z.`)) return;
+    canvas.resetAllLines();
+    showToast("Line numbers recalculated");
   });
 
   async function doSave(markComplete) {

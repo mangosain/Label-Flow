@@ -191,6 +191,10 @@ function renderWorkspace(resumed) {
             <input type="checkbox" id="show-label-input" />
             <span>Show label input box</span>
           </label>
+          <button type="button" id="recalc-lines" class="btn sm" style="width:100%;" title="Clear every manual or pre-annotation line number on this page and reapply the tool's own automatic top-to-bottom numbering (any line-annotation regions you've drawn stay in effect). Undoable with Ctrl/Cmd+Z.">
+            <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Recalculate lines
+          </button>
         </div>
         <div>
           <div class="section-title">Labels</div>
@@ -251,6 +255,13 @@ function renderWorkspace(resumed) {
 
   $("#save").addEventListener("click", () => saveWork(false));
   $("#complete").addEventListener("click", () => saveWork(true));
+  $("#recalc-lines").addEventListener("click", () => {
+    const n = canvas.countManualLineOverrides();
+    if (!n) { showToast("Every shape on this page is already automatic — nothing to recalculate."); return; }
+    if (!confirm(`Recalculate line & sequence numbers for this page?\n\nThis clears ${n} manual or pre-annotation line number${n === 1 ? "" : "s"} and reapplies the tool's automatic top-to-bottom numbering. Any line-annotation regions you've drawn stay in effect. You can undo this with Ctrl/Cmd+Z.`)) return;
+    canvas.resetAllLines();
+    showToast("Line numbers recalculated");
+  });
   ["json", "xml", "voc", "coco", "yolo"].forEach((fmt) => {
     $(`#download-${fmt}`).addEventListener("click", () => downloadExport(fmt));
   });
@@ -342,6 +353,18 @@ const EXPORT_EXT = { json: "json", xml: "xml", voc: "xml", coco: "json", yolo: "
 // each have exactly one coordinate convention fixed by their own spec, so
 // the question would be pointless (or actively misleading) for those.
 async function downloadExport(format) {
+  // Export always reads from the server's last-saved copy, never straight
+  // off the canvas -- so unsaved edits here would silently export stale
+  // numbers. askUnsavedChanges shows exactly what's unsaved (and where) and
+  // lets you save first instead of finding out after the fact.
+  if (canvas.isDirty()) {
+    const decision = await askUnsavedChanges(canvas);
+    if (decision === "cancel") return;
+    if (decision === "save") {
+      await saveWork(false);
+      if (canvas.isDirty()) return; // save failed -- saveWork already toasted the error
+    }
+  }
   let coords = null;
   if (format === "json" || format === "xml") {
     coords = await askExportCoords();

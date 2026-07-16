@@ -35,6 +35,44 @@ function rememberLabel(name) {
 const clamp01 = (n) => Math.max(0, Math.min(1, n));
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
 
+// ---------- unsaved-change diffing (shared by both pages via canvas.getUnsavedChanges()) ----------
+// Plain-data deep clone -- annotations/regions are JSON-safe (no functions,
+// dates, etc.), so this is simpler and more broadly compatible than
+// structuredClone for what's really just a snapshot-for-later-comparison.
+const cloneData = (v) => JSON.parse(JSON.stringify(v));
+
+function shapeGeometryEqual(a, b) {
+  if (a.type !== b.type) return false;
+  if (a.type === "bbox") {
+    const r1 = a.rect, r2 = b.rect;
+    return Boolean(r1 && r2 && r1.x === r2.x && r1.y === r2.y && r1.w === r2.w && r1.h === r2.h);
+  }
+  const p1 = a.points || [], p2 = b.points || [];
+  return p1.length === p2.length && p1.every((p, i) => p.x === p2[i].x && p.y === p2[i].y);
+}
+/** Human-readable list of what changed between the saved and current version
+ *  of the same shape (by id) -- label, manual line override, and/or its
+ *  actual geometry -- for the unsaved-changes dialog. Empty-list case
+ *  ("changed" fallback) guards against a diff dimension added to shapes
+ *  later without a matching check being added here. */
+function describeShapeDiff(prev, cur) {
+  const out = [];
+  if ((prev.labelId ?? null) !== (cur.labelId ?? null)) out.push("label changed");
+  if ((prev.line ?? null) !== (cur.line ?? null)) out.push("line number changed");
+  if (!shapeGeometryEqual(prev, cur)) out.push(prev.type === "polygon" ? "shape reshaped" : "position/size changed");
+  return out.length ? out : ["changed"];
+}
+function regionGeometryEqual(a, b) {
+  const p1 = a.points || [], p2 = b.points || [];
+  return p1.length === p2.length && p1.every((p, i) => p.x === p2[i].x && p.y === p2[i].y);
+}
+function describeRegionDiff(prev, cur) {
+  const out = [];
+  if ((prev.line ?? null) !== (cur.line ?? null)) out.push(`line number changed (${prev.line} → ${cur.line})`);
+  if (!regionGeometryEqual(prev, cur)) out.push("region reshaped/moved");
+  return out.length ? out : ["changed"];
+}
+
 // Whether to show it is remembered per-browser (like label history) so it
 // stays off/on across images and reloads instead of resetting every time.
 const SHOW_LINES_KEY = "labeler_show_line_numbers";
@@ -136,6 +174,77 @@ function askExportCoords() {
 }
 window.askExportCoords = askExportCoords;
 
+// ---------- unsaved-changes warning dialog (shared by both pages) ----------
+/** One row in the unsaved-changes dialog: what kind of edit, where it is
+ *  (line/seq -- the same coordinates the canvas tags and the exporter both
+ *  use), and what specifically changed. Still-present shapes are clickable
+ *  (jump the canvas to them); deleted shapes/regions have nothing left on
+ *  the canvas to jump to, so they're listed but not clickable. */
+function unsavedRowHtml(item, isRegion) {
+  const kindLabel = item.kind === "added" ? "Added" : item.kind === "deleted" ? "Deleted" : "Modified";
+  const kindClass = item.kind === "added" ? "green" : item.kind === "deleted" ? "red" : "amber";
+  const where = `Line ${item.line}${!isRegion ? `-${item.seq}` : ""}`;
+  const what = isRegion
+    ? "Line-annotation region"
+    : `${item.type === "polygon" ? "Polygon" : "Box"}${item.labelName ? ` "${item.labelName}"` : " (unlabeled)"}`;
+  const detail = item.changes ? ` — ${item.changes.join(", ")}` : "";
+  const jumpable = !isRegion && item.kind !== "deleted";
+  return `<li class="unsaved-row${jumpable ? " jumpable" : ""}" ${jumpable ? `data-jump="${item.id}" tabindex="0" role="button"` : ""}>
+    <span class="badge ${kindClass}">${kindLabel}</span>
+    <span class="unsaved-row-text">${where} &middot; ${what}${detail}</span>
+  </li>`;
+}
+
+/** Shows what's unsaved on this page (which shapes/regions, where, and what
+ *  changed about each) before an export that would otherwise silently use
+ *  the last-saved version instead of what's on screen. Resolves to
+ *  "save" | "export" | "cancel". Clicking a still-present row jumps the
+ *  canvas to it (via selectAnnotation) without closing the dialog, so you
+ *  can review several before deciding. */
+function askUnsavedChanges(canvas) {
+  return new Promise((resolve) => {
+    const diff = canvas.getUnsavedChanges();
+    const rows = [
+      ...diff.shapes.map((s) => unsavedRowHtml(s, false)),
+      ...diff.regions.map((r) => unsavedRowHtml(r, true)),
+    ].join("");
+
+    const dlg = document.createElement("dialog");
+    dlg.className = "export-coords-dialog unsaved-changes-dialog";
+    dlg.innerHTML = `
+      <form method="dialog">
+        <h3>You have unsaved changes</h3>
+        <p class="faint">Exporting now would use the last saved version of this page, not what's on screen. Here's what's changed:</p>
+        <ul class="unsaved-list">${rows}</ul>
+        <div class="row" style="justify-content:flex-end; margin-top:16px; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="btn" data-act="cancel">Cancel</button>
+          <button type="button" class="btn" data-act="export">Export anyway (stale)</button>
+          <button type="button" class="btn primary" data-act="save">Save &amp; Export</button>
+        </div>
+      </form>`;
+    document.body.appendChild(dlg);
+
+    dlg.querySelectorAll("[data-jump]").forEach((row) => {
+      row.addEventListener("click", () => canvas.selectAnnotation(row.dataset.jump));
+    });
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+      dlg.remove();
+    };
+    dlg.querySelector('[data-act="cancel"]').addEventListener("click", () => { dlg.close(); finish("cancel"); });
+    dlg.querySelector('[data-act="export"]').addEventListener("click", () => { dlg.close(); finish("export"); });
+    dlg.querySelector('[data-act="save"]').addEventListener("click", () => { dlg.close(); finish("save"); });
+    dlg.addEventListener("cancel", () => finish("cancel")); // Esc key
+    dlg.addEventListener("close", () => finish("cancel"));  // any other dismissal path
+    dlg.showModal();
+  });
+}
+window.askUnsavedChanges = askUnsavedChanges;
+
 class AnnotationCanvas {
   constructor(container, opts) {
     this.container = container;
@@ -168,6 +277,12 @@ class AnnotationCanvas {
     this.highlightLabelId = null; // set via toggleHighlightLabel() from the Labels sidebar
     this.lastAssigned = null;
     this.dirty = false;
+    // Snapshots of annotations/lineRegions as of the last load()/markSaved()
+    // -- i.e. what the server actually has on disk right now. Diffed against
+    // the live collections above to answer "what exactly is unsaved" (see
+    // getUnsavedChanges()), not just the yes/no isDirty() flag.
+    this._savedAnnotations = [];
+    this._savedRegions = [];
     this.showLineNumbers = loadShowLineNumbers();
     this.showLabelInput = loadShowLabelInput();
     this.drag = { mode: "none" };
@@ -187,6 +302,8 @@ class AnnotationCanvas {
     this.selectedId = null; this.selectedRegionId = null; this.pendingLabelId = null; this.highlightLabelId = null;
     this.undoStack = []; this.redoStack = [];
     this.dirty = false;
+    this._savedAnnotations = cloneData(this.annotations);
+    this._savedRegions = cloneData(this.lineRegions);
     this._closeEditors();
     this.img = new Image();
     this.img.onload = () => { this.fit(); };
@@ -212,7 +329,64 @@ class AnnotationCanvas {
       .sort((x, y) => x.line - y.line || x.seq - y.seq);
   }
   isDirty() { return this.dirty; }
-  markSaved() { this.dirty = false; this.opts.onChange && this.opts.onChange(); }
+  markSaved() {
+    this.dirty = false;
+    this._savedAnnotations = cloneData(this.annotations);
+    this._savedRegions = cloneData(this.lineRegions);
+    this.opts.onChange && this.opts.onChange();
+  }
+
+  /** Everything that differs from the last save, shape-by-shape and
+   *  region-by-region -- for the "you have unsaved changes" export warning.
+   *  Each entry carries its CURRENT line/seq (or, for a deleted shape, the
+   *  line/seq it had as of the last save, since it no longer has a "current"
+   *  one) so the dialog can say exactly where to look, not just that
+   *  something changed. Shape entries also carry the id so the caller can
+   *  jump the canvas to it (selectAnnotation) -- deleted shapes have nothing
+   *  left to jump to, so callers should skip that affordance for those. */
+  getUnsavedChanges() {
+    const savedById = new Map(this._savedAnnotations.map((a) => [a.id, a]));
+    const curById = new Map(this.annotations.map((a) => [a.id, a]));
+    const curInfo = LFLines.computeLineNumbers(this.annotations, this.lineRegions);
+    const savedInfo = LFLines.computeLineNumbers(this._savedAnnotations, this._savedRegions);
+
+    const shapes = [];
+    for (const a of this.annotations) {
+      const prev = savedById.get(a.id);
+      const i = curInfo.get(a.id) || { line: 1, seq: 1 };
+      const label = this._labelOf(a.labelId);
+      const base = { id: a.id, type: a.type, labelName: label ? label.name : null, line: i.line, seq: i.seq };
+      if (!prev) shapes.push({ ...base, kind: "added" });
+      else {
+        const isSame = (prev.labelId ?? null) === (a.labelId ?? null) && (prev.line ?? null) === (a.line ?? null) && shapeGeometryEqual(prev, a);
+        if (!isSame) shapes.push({ ...base, kind: "modified", changes: describeShapeDiff(prev, a) });
+      }
+    }
+    for (const a of this._savedAnnotations) {
+      if (curById.has(a.id)) continue;
+      const i = savedInfo.get(a.id) || { line: 1, seq: 1 };
+      const label = this._labelOf(a.labelId);
+      shapes.push({ id: a.id, type: a.type, labelName: label ? label.name : null, line: i.line, seq: i.seq, kind: "deleted" });
+    }
+    shapes.sort((x, y) => x.line - y.line || x.seq - y.seq);
+
+    const savedRegionById = new Map(this._savedRegions.map((r) => [r.id, r]));
+    const curRegionById = new Map(this.lineRegions.map((r) => [r.id, r]));
+    const regions = [];
+    for (const r of this.lineRegions) {
+      const prev = savedRegionById.get(r.id);
+      if (!prev) regions.push({ id: r.id, line: r.line, kind: "added" });
+      else if (!regionGeometryEqual(prev, r) || (prev.line ?? null) !== (r.line ?? null)) {
+        regions.push({ id: r.id, line: r.line, kind: "modified", changes: describeRegionDiff(prev, r) });
+      }
+    }
+    for (const r of this._savedRegions) {
+      if (!curRegionById.has(r.id)) regions.push({ id: r.id, line: r.line, kind: "deleted" });
+    }
+    regions.sort((x, y) => x.line - y.line);
+
+    return { shapes, regions, hasChanges: shapes.length > 0 || regions.length > 0 };
+  }
   setTool(t) {
     this.tool = t;
     this._cancelPolygon();
@@ -285,6 +459,28 @@ class AnnotationCanvas {
   deleteRegion(id) {
     if (this.selectedRegionId === id) { this.selectedRegionId = null; this._closeEditors(); }
     this._mutateRegions(this.lineRegions.filter((r) => r.id !== id));
+  }
+
+  /** How many shapes on this page currently carry a manual line override
+   *  (whether typed in by hand or brought in by pre-annotation import) --
+   *  used to gray out / label the "Recalculate lines" button when there's
+   *  nothing for it to do. */
+  countManualLineOverrides() {
+    return this.annotations.reduce((n, a) => n + (typeof a.line === "number" ? 1 : 0), 0);
+  }
+
+  /** Strip every shape's manual line override on this page (whether it was
+   *  typed in by hand via the line chip, or arrived as a `line` value on
+   *  pre-annotation import) and fall back to the tool's own top-to-bottom
+   *  automatic numbering for all of them. Deliberately does NOT touch line
+   *  regions -- those are a page-level fix drawn in this tool (not something
+   *  pre-annotation could have set), so a "start over from automatic" reset
+   *  leaves them in place; delete a region separately if you want that gone
+   *  too. Goes through the normal _mutate() path, so this is undoable
+   *  (Ctrl/Cmd+Z) and recomputes line/sequence for everyone in one redraw. */
+  resetAllLines() {
+    if (this.selectedId) { this.selectedId = null; this.pendingLabelId = null; this._closeEditors(); }
+    this._mutate(this.annotations.map((a) => (typeof a.line === "number" ? { ...a, line: null } : a)));
   }
 
   /** Called after a label is deleted server-side (admin's Labels panel,
